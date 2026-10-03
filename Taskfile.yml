@@ -1,0 +1,25 @@
+version: '3'
+
+vars:
+  BIN: gca
+
+tasks:
+  build:
+    desc: Build the binary
+    cmds:
+      - go build -o {{.BIN}} ./cmd
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  clean:
+    desc: Remove built binary
+    cmds:
+      - rm -f {{.BIN}}
