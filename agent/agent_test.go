@@ -75,6 +75,14 @@ func TestAgentPromptRoundTrip(t *testing.T) {
 	if initResp.AgentInfo == nil || initResp.AgentInfo.Name != "genkit-code-agent" {
 		t.Fatalf("agent info = %+v", initResp.AgentInfo)
 	}
+	// Resume is the advertised way back into a session; load is not, since it
+	// would promise a history replay.
+	if initResp.AgentCapabilities.SessionCapabilities.Resume == nil {
+		t.Fatal("resume capability not advertised")
+	}
+	if initResp.AgentCapabilities.LoadSession {
+		t.Fatal("loadSession advertised without a replay to serve")
+	}
 
 	sessResp, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
 	if err != nil {
@@ -99,6 +107,31 @@ func TestAgentPromptRoundTrip(t *testing.T) {
 	got := tc.updates
 	tc.mu.Unlock()
 	if len(got) == 0 || got[0] != "Echo: hello world" {
+		t.Fatalf("updates = %q", got)
+	}
+
+	// An id the client names, as it would after reconnecting to an old thread.
+	resumed, err := clientConn.ResumeSession(ctx, acp.ResumeSessionRequest{
+		SessionId: "sess_from_before_restart",
+		Cwd:       "/tmp",
+	})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if len(resumed.ConfigOptions) != 0 {
+		t.Fatalf("options = %+v, want none without models configured", resumed.ConfigOptions)
+	}
+	if _, err := clientConn.Prompt(ctx, acp.PromptRequest{
+		SessionId: "sess_from_before_restart",
+		Prompt:    []acp.ContentBlock{acp.TextBlock("again")},
+	}); err != nil {
+		t.Fatalf("prompt after resume: %v", err)
+	}
+
+	tc.mu.Lock()
+	got = tc.updates
+	tc.mu.Unlock()
+	if len(got) != 2 || got[1] != "Echo: again" {
 		t.Fatalf("updates = %q", got)
 	}
 

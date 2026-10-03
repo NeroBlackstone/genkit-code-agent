@@ -45,10 +45,14 @@ Model config lives at `~/.gca/gca.json`:
 }
 ```
 
-- `provider` is an array of providers, each mapped to its own `compat_oai.OpenAICompatible` plugin: `name` becomes the model ID prefix (the full model reference is `name/id`), `baseUrl` is the OpenAI-compatible endpoint, `apiKey` authenticates the requests (empty means no auth). Names must be unique; every provider needs at least one model.
-- `model` is the array of models served by that provider: `id` is the model name, `temperature` is an optional sampling setting. `max_tokens` is never sent; the endpoint's default output cap applies.
-- The agent runs the first model of the first provider; the remaining entries are configured and resolvable under their `name/id` references.
+- `provider` is an array of providers. A `name` from the table below is served by that provider's dedicated plugin; any other name, and a named provider configured without an API key while its key environment variables are empty, is served by the base `compat_oai.OpenAICompatible` plugin, since the dedicated plugins panic at startup with no key. `name` is the model ID prefix (the full model reference is `name/id`), `baseUrl` is the endpoint the plugin is pointed at, `apiKey` authenticates the requests (empty means no auth). Names must be unique; every provider needs at least one model.
+- `model` is the array of models served by that provider: `id` is the model name, `temperature` is an optional sampling setting, applied through the provider's own config type (Kimi's has no temperature field, so it is dropped there). DeepSeek requests also carry `thinking: {"type": "enabled"}` so reasoning is asked for explicitly. `max_tokens` is never sent; the endpoint's default output cap applies.
+- Every configured model is exposed to the client as an ACP session config option (`category: "model"`, grouped by provider). The client switches with `session/set_config_option`, which changes the model for that session only; a new session starts on the first model of the first provider, what `Config.Active` names.
 - If `~/.gca/gca.json` is absent the agent runs without a model and echoes prompts; a present-but-invalid file is a startup error.
+
+## Sessions
+
+Sessions live in memory only. The agent advertises `session/resume` (not `session/load`): a client reopening a thread names the session id, and an id it does not know is registered on the spot with the default model, so prompts continue without any history replay. Nothing survives a restart of `gca`; `session/load` with a replayed conversation is left for when sessions are persisted.
 
 ## Supported providers
 
