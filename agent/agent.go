@@ -7,6 +7,8 @@ import (
 	"uuid"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/firebase/genkit/go/ai"
+	"github.com/firebase/genkit/go/genkit"
 )
 
 type Session struct {
@@ -17,6 +19,9 @@ type Agent struct {
 	conn     *acp.AgentSideConnection
 	sessions map[string]*Session
 	mu       sync.Mutex
+
+	g     *genkit.Genkit
+	model ai.ModelArg
 }
 
 var _ acp.Agent = (*Agent)(nil)
@@ -27,6 +32,13 @@ func New() *Agent {
 
 func (a *Agent) SetAgentConnection(conn *acp.AgentSideConnection) {
 	a.conn = conn
+}
+
+// SetModel wires the genkit instance and model used by runTurn. Without it
+// the agent falls back to echoing the prompt.
+func (a *Agent) SetModel(g *genkit.Genkit, model ai.ModelArg) {
+	a.g = g
+	a.model = model
 }
 
 func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
