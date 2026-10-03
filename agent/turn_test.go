@@ -8,6 +8,7 @@ import (
 )
 
 func TestUpdateForPart(t *testing.T) {
+	const messageID = "msg_test"
 	tests := []struct {
 		name string
 		part *ai.Part
@@ -50,7 +51,7 @@ func TestUpdateForPart(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := updateForPart(tt.part)
+			got, ok := updateForPart(tt.part, messageID)
 			if ok != tt.ok {
 				t.Fatalf("ok = %v, want %v", ok, tt.ok)
 			}
@@ -61,11 +62,17 @@ func TestUpdateForPart(t *testing.T) {
 				if got.AgentMessageChunk.Content.Text == nil || got.AgentMessageChunk.Content.Text.Text != tt.want.AgentMessageChunk.Content.Text.Text {
 					t.Fatalf("update = %+v, want %+v", got, tt.want)
 				}
+				if got.AgentMessageChunk.MessageId == nil || *got.AgentMessageChunk.MessageId != messageID {
+					t.Fatalf("messageId = %v, want %q", got.AgentMessageChunk.MessageId, messageID)
+				}
 				return
 			}
 			if got.AgentThoughtChunk != nil && tt.want.AgentThoughtChunk != nil {
 				if got.AgentThoughtChunk.Content.Text == nil || got.AgentThoughtChunk.Content.Text.Text != tt.want.AgentThoughtChunk.Content.Text.Text {
 					t.Fatalf("update = %+v, want %+v", got, tt.want)
+				}
+				if got.AgentThoughtChunk.MessageId == nil || *got.AgentThoughtChunk.MessageId != messageID {
+					t.Fatalf("messageId = %v, want %q", got.AgentThoughtChunk.MessageId, messageID)
 				}
 				return
 			}

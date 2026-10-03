@@ -50,6 +50,9 @@ func (c *testClient) WaitForTerminalExit(ctx context.Context, p acp.WaitForTermi
 }
 
 func TestAgentPromptRoundTrip(t *testing.T) {
+	// Keep the session store away from the real ~/.gca.
+	t.Setenv("HOME", t.TempDir())
+
 	agentToClientR, agentToClientW := io.Pipe()
 	clientToAgentR, clientToAgentW := io.Pipe()
 
@@ -75,13 +78,13 @@ func TestAgentPromptRoundTrip(t *testing.T) {
 	if initResp.AgentInfo == nil || initResp.AgentInfo.Name != "genkit-code-agent" {
 		t.Fatalf("agent info = %+v", initResp.AgentInfo)
 	}
-	// Resume is the advertised way back into a session; load is not, since it
-	// would promise a history replay.
+	// Sessions persist to disk, so loadSession (replay from a stored
+	// transcript) and resume (continue without replay) are both served.
 	if initResp.AgentCapabilities.SessionCapabilities.Resume == nil {
 		t.Fatal("resume capability not advertised")
 	}
-	if initResp.AgentCapabilities.LoadSession {
-		t.Fatal("loadSession advertised without a replay to serve")
+	if !initResp.AgentCapabilities.LoadSession {
+		t.Fatal("loadSession not advertised despite stored transcripts")
 	}
 
 	sessResp, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
@@ -101,6 +104,11 @@ func TestAgentPromptRoundTrip(t *testing.T) {
 	}
 	if promptResp.StopReason != acp.StopReasonEndTurn {
 		t.Fatalf("stop reason = %v, want %v", promptResp.StopReason, acp.StopReasonEndTurn)
+	}
+	// The client named no id, so the agent assigned one: the echo must be
+	// present even on the modelless fallback path.
+	if promptResp.UserMessageId == nil || *promptResp.UserMessageId == "" {
+		t.Fatal("userMessageId missing from prompt response")
 	}
 
 	tc.mu.Lock()

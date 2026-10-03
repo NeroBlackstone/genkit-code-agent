@@ -28,6 +28,7 @@ func modelOption(t *testing.T, options []acp.SessionConfigOption) *acp.SessionCo
 }
 
 func TestNewSessionOffersModelOption(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
 	ag := New()
 	ag.SetModels(nil, testModels())
 
@@ -64,6 +65,7 @@ func TestNewSessionOffersModelOption(t *testing.T) {
 }
 
 func TestNewSessionWithoutModels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
 	resp, err := New().NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
 	if err != nil {
 		t.Fatalf("new session: %v", err)
@@ -74,6 +76,7 @@ func TestNewSessionWithoutModels(t *testing.T) {
 }
 
 func TestSetSessionConfigOption(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
 	ag := New()
 	ag.SetModels(nil, testModels())
 	resp, err := ag.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
@@ -126,6 +129,7 @@ func TestSetSessionConfigOption(t *testing.T) {
 }
 
 func TestResumeSessionAdoptsClientID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
 	ag := New()
 	ag.SetModels(nil, testModels())
 
@@ -147,6 +151,7 @@ func TestResumeSessionAdoptsClientID(t *testing.T) {
 }
 
 func TestResumeSessionKeepsModelSelection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
 	ag := New()
 	ag.SetModels(nil, testModels())
 	resp, err := ag.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})

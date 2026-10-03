@@ -2,11 +2,17 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"sync"
 	"uuid"
 
+	"genkit-code-agent/store"
+
 	"github.com/coder/acp-go-sdk"
+	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
 )
 
@@ -28,6 +34,16 @@ type Session struct {
 	// model is the ref of the model this session runs, taken from the model
 	// config option and defaulting to the first configured model.
 	model string
+	// ws persists this session's transcript, nil when the cwd gave no
+	// workspace to write to.
+	ws *store.Workspace
+	// meta is the stored envelope's metadata, refreshed on every save.
+	meta store.SessionMeta
+	// transcript is the full conversation, oldest first, guarded by
+	// Agent.mu and written to disk after every successful turn. Only its
+	// most recent window is ever replayed to the model; session/load can
+	// replay all of it.
+	transcript []*ai.Message
 }
 
 type Agent struct {
@@ -39,7 +55,10 @@ type Agent struct {
 	models []Model
 }
 
-var _ acp.Agent = (*Agent)(nil)
+var (
+	_ acp.Agent       = (*Agent)(nil)
+	_ acp.AgentLoader = (*Agent)(nil)
+)
 
 func New() *Agent {
 	return &Agent{sessions: make(map[string]*Session)}
@@ -65,12 +84,11 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (a
 			Version: "0.1.0",
 		},
 		AgentCapabilities: acp.AgentCapabilities{
-			// LoadSession stays false: session/load asks the agent to replay
-			// the whole conversation, which nothing in memory can do yet.
-			// Resume is the capability for continuing without history, which
-			// is exactly what an in-memory session can offer, and it is what
-			// Zed falls back to when loadSession is off.
-			LoadSession: false,
+			// LoadSession is served from transcripts stored on disk: session/load
+			// restores the session and streams its history back as notifications.
+			// Resume stays the lighter way in, for a client that already has the
+			// history itself and is what Zed falls back to when loadSession is off.
+			LoadSession: true,
 			SessionCapabilities: acp.SessionCapabilities{
 				Resume: &acp.SessionResumeCapabilities{},
 			},
@@ -85,7 +103,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (a
 
 func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	sid := randomID()
-	s := a.openSession(sid)
+	s := a.openSession(sid, params.Cwd)
 	return acp.NewSessionResponse{
 		SessionId:     acp.SessionId(sid),
 		ConfigOptions: a.configOptions(s.model),
@@ -93,17 +111,38 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 }
 
 // ResumeSession continues a session by the id the client names, without
-// replaying history, which is what the resume capability promises. Sessions
-// live only in memory, so an id still registered keeps its state and an id
-// from before this process started is registered here with the default model.
+// replaying history, which is what the resume capability promises. A stored
+// transcript for that id is still loaded, so an id from before this process
+// started keeps its conversation and the model it ran on; an unknown id is
+// registered here with the default model.
 func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	s := a.openSession(string(params.SessionId))
+	s := a.openSession(string(params.SessionId), params.Cwd)
 	return acp.ResumeSessionResponse{ConfigOptions: a.configOptions(s.model)}, nil
 }
 
+// LoadSession restores a stored session and streams its whole transcript back
+// to the client as notifications, which is what session/load asks the agent
+// to do now that transcripts live on disk.
+func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	s := a.openSession(string(params.SessionId), params.Cwd)
+	a.mu.Lock()
+	msgs := append([]*ai.Message(nil), s.transcript...)
+	model := s.model
+	a.mu.Unlock()
+	for _, m := range msgs {
+		for _, update := range updatesForReplay(m) {
+			if err := a.sendUpdate(ctx, params.SessionId, update); err != nil {
+				return acp.LoadSessionResponse{}, err
+			}
+		}
+	}
+	return acp.LoadSessionResponse{ConfigOptions: a.configOptions(model)}, nil
+}
+
 // openSession returns the session for sid, registering it with the default
-// model first when it is not registered yet.
-func (a *Agent) openSession(sid string) *Session {
+// model first when it is not registered yet, and adopting the transcript
+// stored for it in cwd's workspace when one exists.
+func (a *Agent) openSession(sid, cwd string) *Session {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if s, ok := a.sessions[sid]; ok {
@@ -113,8 +152,42 @@ func (a *Agent) openSession(sid string) *Session {
 	if len(a.models) > 0 {
 		s.model = a.models[0].Ref
 	}
+	if cwd != "" {
+		a.attachStore(s, sid, cwd)
+	}
 	a.sessions[sid] = s
 	return s
+}
+
+// attachStore opens cwd's workspace and, when a stored transcript for sid
+// exists, adopts it along with the model that session ran on. Callers hold
+// a.mu. A workspace that cannot be opened leaves the session in memory only;
+// a transcript that cannot be read is reported and skipped, the file having
+// been quarantined by the store.
+func (a *Agent) attachStore(s *Session, sid, cwd string) {
+	ws, err := store.Open(cwd)
+	if err != nil {
+		slog.Warn("workspace unavailable, session will not persist", "cwd", cwd, "error", err)
+		return
+	}
+	s.ws = ws
+	msgs, meta, err := ws.Load(sid)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// A new session: nothing stored yet, which is the normal case.
+		return
+	case err != nil:
+		// Quarantined or unreadable: keep the session, start the transcript
+		// empty, and say so; the store preserved the original bytes.
+		slog.Warn("stored transcript unusable, starting empty", "session", sid, "error", err)
+		return
+	}
+	s.transcript, s.meta = msgs, meta
+	if meta.Model != "" {
+		if _, ok := a.modelFor(meta.Model); ok {
+			s.model = meta.Model
+		}
+	}
 }
 
 func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
@@ -132,6 +205,14 @@ func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 		return acp.PromptResponse{}, fmt.Errorf("session %s not found", sid)
 	}
 
+	// The id this turn's user message goes under: the client's own when it
+	// named one, ours otherwise, so the response can always echo an id and
+	// the turn can stamp it into the stored transcript either way.
+	userMsgID := uuid.New().String()
+	if params.MessageId != nil && *params.MessageId != "" {
+		userMsgID = *params.MessageId
+	}
+
 	if s.Cancel != nil {
 		s.Cancel()
 	}
@@ -146,13 +227,13 @@ func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 		a.mu.Unlock()
 	}()
 
-	if err := a.runTurn(turnCtx, params, modelRef); err != nil {
+	if err := a.runTurn(turnCtx, params, s, modelRef, userMsgID); err != nil {
 		if turnCtx.Err() != nil {
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: &userMsgID}, nil
 		}
 		return acp.PromptResponse{}, err
 	}
-	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn, UserMessageId: &userMsgID}, nil
 }
 
 func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error {
