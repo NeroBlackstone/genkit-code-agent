@@ -23,7 +23,7 @@ const valid = `{
       "baseUrl": "https://api.deepseek.com",
       "apiKey": "k",
       "model": [
-        {"id": "deepseek-flash", "temperature": 0.7, "maxTokens": 1000000},
+        {"id": "deepseek-flash", "temperature": 0.7},
         {"id": "deepseek-chat"}
       ]
     },
@@ -46,7 +46,7 @@ func TestLoadMultiProvider(t *testing.T) {
 	if len(cfg.Provider[0].Model) != 2 || cfg.Provider[0].Model[1].ID != "deepseek-chat" {
 		t.Fatalf("first provider models = %+v", cfg.Provider[0].Model)
 	}
-	if m.Temperature == nil || *m.Temperature != 0.7 || m.MaxTokens == nil || *m.MaxTokens != 1000000 {
+	if m.Temperature == nil || *m.Temperature != 0.7 {
 		t.Fatalf("model params = %+v", m)
 	}
 }

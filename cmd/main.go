@@ -96,8 +96,5 @@ func modelParams(m config.Model) *openai.ChatCompletionNewParams {
 	if m.Temperature != nil {
 		params.Temperature = openai.Float(*m.Temperature)
 	}
-	if m.MaxTokens != nil {
-		params.MaxTokens = openai.Int(int64(*m.MaxTokens))
-	}
 	return params
 }

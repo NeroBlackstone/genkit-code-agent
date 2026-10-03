@@ -10,7 +10,6 @@ import (
 type Model struct {
 	ID          string   `json:"id"`
 	Temperature *float64 `json:"temperature,omitempty"`
-	MaxTokens   *int     `json:"maxTokens,omitempty"`
 }
 
 type Provider struct {

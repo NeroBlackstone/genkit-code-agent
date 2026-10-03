@@ -28,8 +28,7 @@ Model config lives at `~/.gca/gca.json`:
       "model": [
         {
           "id": "gpt-4o-mini",
-          "temperature": 0.7,
-          "maxTokens": 1024
+          "temperature": 0.7
         },
         { "id": "gpt-4o" }
       ]
@@ -39,7 +38,7 @@ Model config lives at `~/.gca/gca.json`:
       "baseUrl": "https://api.deepseek.com",
       "apiKey": "",
       "model": [
-        { "id": "deepseek-chat", "maxTokens": 1000000 }
+        { "id": "deepseek-chat" }
       ]
     }
   ]
@@ -47,7 +46,7 @@ Model config lives at `~/.gca/gca.json`:
 ```
 
 - `provider` is an array of providers, each mapped to its own `compat_oai.OpenAICompatible` plugin: `name` becomes the model ID prefix (the full model reference is `name/id`), `baseUrl` is the OpenAI-compatible endpoint, `apiKey` authenticates the requests (empty means no auth). Names must be unique; every provider needs at least one model.
-- `model` is the array of models served by that provider: `id` is the model name, `temperature` and `maxTokens` are optional sampling settings.
+- `model` is the array of models served by that provider: `id` is the model name, `temperature` is an optional sampling setting. `max_tokens` is never sent; the endpoint's default output cap applies.
 - The agent runs the first model of the first provider; the remaining entries are configured and resolvable under their `name/id` references.
 - If `~/.gca/gca.json` is absent the agent runs without a model and echoes prompts; a present-but-invalid file is a startup error.
 
