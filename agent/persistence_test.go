@@ -101,14 +101,16 @@ func TestTranscriptSurvivesRestart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	ag2.mu.Lock()
-	var stored []*ai.Message
-	if s := ag2.sessions[string(sess.SessionId)]; s != nil {
-		stored = s.transcript
+	s2, ok := ag2.get(string(sess.SessionId))
+	if !ok {
+		t.Fatal("resumed session not registered")
 	}
-	ag2.mu.Unlock()
+	stored, _, err := s2.load(string(sess.SessionId))
+	if err != nil {
+		t.Fatalf("read stored transcript: %v", err)
+	}
 	if len(stored) != 4 {
-		t.Fatalf("restored transcript = %d messages, want 4", len(stored))
+		t.Fatalf("stored transcript = %d messages, want 4", len(stored))
 	}
 
 	if _, err := client2.Prompt(ctx, acp.PromptRequest{
@@ -227,9 +229,10 @@ func TestLoadSessionReplaysTranscript(t *testing.T) {
 	}
 }
 
-// TestResumeRestoresTranscriptAndModel exercises the load path directly: a
-// stored transcript and its model come back when the session id is resumed,
-// even after a model selection moved off the default.
+// TestResumeRestoresTranscriptAndModel exercises the resume path directly:
+// resuming a stored id points the session back at its workspace, so the
+// stored conversation reads back through it, and the model it last ran on
+// comes back with it even after a selection moved off the default.
 func TestResumeRestoresTranscriptAndModel(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
@@ -246,8 +249,7 @@ func TestResumeRestoresTranscriptAndModel(t *testing.T) {
 		t.Fatalf("seed store: %v", err)
 	}
 
-	ag := New()
-	ag.SetModels(nil, testModels())
+	ag := New(nil, testModels())
 	if _, err := ag.ResumeSession(context.Background(), acp.ResumeSessionRequest{
 		SessionId: "sess_restore",
 		Cwd:       cwd,
@@ -255,18 +257,18 @@ func TestResumeRestoresTranscriptAndModel(t *testing.T) {
 		t.Fatalf("resume: %v", err)
 	}
 
-	ag.mu.Lock()
-	s := ag.sessions["sess_restore"]
-	var transcript []*ai.Message
-	var model string
-	if s != nil {
-		transcript, model = s.transcript, s.model
+	s, ok := ag.get("sess_restore")
+	if !ok {
+		t.Fatal("resumed session not registered")
 	}
-	ag.mu.Unlock()
-	if len(transcript) != 2 || transcript[0].Text() != "hi" {
-		t.Errorf("transcript = %+v, want the stored exchange", transcript)
+	loaded, _, err := s.load("sess_restore")
+	if err != nil {
+		t.Fatalf("read stored transcript: %v", err)
 	}
-	if model != "openai/gpt-4o" {
+	if len(loaded) != 2 || loaded[0].Text() != "hi" {
+		t.Errorf("stored transcript = %+v, want the stored exchange", loaded)
+	}
+	if model := s.currentModel(); model != "openai/gpt-4o" {
 		t.Errorf("model = %q, want the stored openai/gpt-4o", model)
 	}
 }

@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/firebase/genkit/go/plugins/compat_oai/deepseek"
 )
@@ -69,10 +68,9 @@ func openAgentPipes(t *testing.T, g *genkit.Genkit, model Model) (*Agent, *acp.C
 	agentToClientR, agentToClientW := io.Pipe()
 	clientToAgentR, clientToAgentW := io.Pipe()
 
-	ag := New()
+	ag := New(g, []Model{model})
 	agentConn := acp.NewAgentSideConnection(ag, agentToClientW, clientToAgentR)
 	ag.SetAgentConnection(agentConn)
-	ag.SetModels(g, []Model{model})
 
 	rc := &recordingClient{}
 	clientConn := acp.NewClientSideConnection(rc, clientToAgentW, agentToClientR)
@@ -390,13 +388,16 @@ func TestRunTurnCarriesHistoryAcrossPrompts(t *testing.T) {
 
 	// The stored history carries both ids in genkit's metadata field: the
 	// user message keeps the id it was prompted with, the answer the msg_
-	// id its chunks streamed under.
-	ag.mu.Lock()
-	var history []*ai.Message
-	if s := ag.sessions[string(sess.SessionId)]; s != nil {
-		history = s.transcript
+	// id its chunks streamed under. The store is where that history lives,
+	// so it is read back from there.
+	s, ok := ag.get(string(sess.SessionId))
+	if !ok {
+		t.Fatal("session not registered")
 	}
-	ag.mu.Unlock()
+	history, _, err := s.load(string(sess.SessionId))
+	if err != nil {
+		t.Fatalf("read stored history: %v", err)
+	}
 	if len(history) != 4 {
 		t.Fatalf("history messages = %d, want 4 (two turns)", len(history))
 	}

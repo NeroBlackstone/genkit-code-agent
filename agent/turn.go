@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"uuid"
@@ -15,15 +16,18 @@ import (
 
 const systemPrompt = `You are a coding agent. You help users with software engineering tasks:
 reading and explaining code, writing and editing files, debugging, running commands,
-and answering technical questions. Be direct and concise. When you change code,
+and answering technical questions. Use the write tool to create or overwrite files;
+it creates parent directories for you. Be direct and concise. When you change code,
 follow the existing project conventions. Never invent file paths or APIs: verify
 them before referring to them.`
 
 // runTurn answers one prompt on the model the session selected, falling back
-// to echoing when no model was configured. A successful turn appends the
-// question and the answer to the session's transcript and writes it to disk;
-// a failed or cancelled one leaves the transcript untouched so no dangling
-// question or half-written answer is replayed to the model or stored.
+// to echoing when no model was configured. The conversation is read from the
+// store at the start of the turn and written back at the end, so a session
+// keeps nothing of it in between; the turn lock covers both, so the next
+// prompt on this session reads what this one wrote. A failed or cancelled
+// turn writes nothing, leaving no dangling question or half-written answer
+// for the next one to replay to the model.
 func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Session, modelRef, userMsgID string) error {
 	userText := extractText(params.Prompt)
 	if userText == "" {
@@ -35,23 +39,33 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 		return a.sendUpdate(ctx, params.SessionId, acp.UpdateAgentMessageText("Echo: "+userText))
 	}
 
-	// Snapshot the transcript under the lock so a selection or a close
-	// landing mid-generation cannot race the read; the copy keeps the slice
-	// the model sees stable while the session keeps its own.
-	a.mu.Lock()
-	history := append([]*ai.Message(nil), s.transcript...)
-	a.mu.Unlock()
+	s.turn.Lock()
+	defer s.turn.Unlock()
+
+	// A prompt that arrived behind an earlier one cancels it, then waits for
+	// the lock here; by the time it gets in, its own turn may already have
+	// been superseded too, and there is no point reading a history it will
+	// never write.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	history, meta, err := s.load(string(params.SessionId))
+	if err != nil {
+		return err
+	}
 
 	// One messageId groups every update of this turn, thinking and answer
 	// alike, which is how Kilo's ACP output labels them and how a client
 	// knows the chunks belong to one message.
 	messageID := "msg_" + uuid.New().String()
 
-	resp, err := genkit.Generate(ctx, a.g,
+	resp, err := genkit.Generate(withCwd(ctx, s.cwd), a.g,
 		ai.WithModel(ai.NewModelRef(model.Ref, model.Config)),
 		ai.WithSystem(systemPrompt),
 		ai.WithMessages(history...),
 		ai.WithPrompt(userText),
+		ai.WithTools(a.tools...),
 		ai.WithStreaming(func(ctx context.Context, chunk *ai.ModelResponseChunk) error {
 			for _, part := range chunk.Content {
 				update, ok := updateForPart(part, messageID)
@@ -69,37 +83,47 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 		return err
 	}
 	if resp == nil || resp.Message == nil || resp.Message.Text() == "" {
-		// Nothing usable came back: skip the turn rather than replaying a
+		// Nothing usable came back: skip the turn rather than storing a
 		// question the model never answered.
 		return nil
 	}
 
-	a.mu.Lock()
 	// Both ids ride in genkit's own metadata field: the user message keeps
 	// the id the client named (or one assigned for it), the answer keeps the
 	// msg_ id its chunks streamed under, so a replay can regroup both.
-	userMsg := ai.NewUserTextMessage(userText)
-	userMsg.Metadata = map[string]any{"messageId": userMsgID}
+	// The transcript genkit hands back is the whole conversation as the last
+	// turn saw it: the system prompt, the stored history, this prompt, and
+	// every tool round in between. The system prompt is re-sent each turn
+	// and belongs to no session, so it is dropped; what remains is this
+	// turn's exchange, appended to the history it ran on.
+	stored := resp.History()
+	if len(stored) > 0 && stored[0].Role == ai.RoleSystem {
+		stored = stored[1:]
+	}
+	stored = append([]*ai.Message{}, stored...)
+	if len(stored) > len(history) {
+		stored[len(history)].Metadata = map[string]any{"messageId": userMsgID}
+	}
 	if resp.Message.Metadata == nil {
 		resp.Message.Metadata = map[string]any{}
 	}
 	resp.Message.Metadata["messageId"] = messageID
-	s.transcript = append(s.transcript, userMsg, resp.Message)
-	// Saving under the same lock as the append keeps concurrent turns from
-	// writing a stale snapshot over a newer one. A failed save is logged,
-	// never fatal: the in-memory transcript still carries the turn.
-	if s.ws != nil {
-		saved, err := s.ws.Save(string(params.SessionId), store.SessionMeta{
-			Model:     modelRef,
-			CreatedAt: s.meta.CreatedAt,
-		}, s.transcript)
-		if err != nil {
-			slog.Warn("persist transcript", "session", params.SessionId, "error", err)
-		} else {
-			s.meta = saved
-		}
+
+	if s.ws == nil {
+		// Nowhere to store it: the turn happened, the next one simply runs
+		// without it.
+		return nil
 	}
-	a.mu.Unlock()
+	// The whole conversation is written back, this turn's exchange included.
+	// A failure is logged rather than raised: the answer already streamed to
+	// the client, so the turn stands, and the store error surfaces as a
+	// shorter conversation on the next one.
+	if _, err := s.ws.Save(string(params.SessionId), store.SessionMeta{
+		Model:     modelRef,
+		CreatedAt: meta.CreatedAt,
+	}, stored); err != nil {
+		slog.Warn("persist transcript", "session", params.SessionId, "error", err)
+	}
 	return nil
 }
 
@@ -167,6 +191,9 @@ func updateForPart(part *ai.Part, messageID string) (acp.SessionUpdate, bool) {
 }
 
 func (a *Agent) sendUpdate(ctx context.Context, sid acp.SessionId, update acp.SessionUpdate) error {
+	if a.conn == nil {
+		return errors.New("agent connection not set")
+	}
 	return a.conn.SessionUpdate(ctx, acp.SessionNotification{
 		SessionId: sid,
 		Update:    update,

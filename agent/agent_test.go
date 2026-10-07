@@ -56,7 +56,7 @@ func TestAgentPromptRoundTrip(t *testing.T) {
 	agentToClientR, agentToClientW := io.Pipe()
 	clientToAgentR, clientToAgentW := io.Pipe()
 
-	ag := New()
+	ag := New(nil, nil)
 	agentConn := acp.NewAgentSideConnection(ag, agentToClientW, clientToAgentR)
 	ag.SetAgentConnection(agentConn)
 

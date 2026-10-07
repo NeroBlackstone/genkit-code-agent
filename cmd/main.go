@@ -56,7 +56,8 @@ func runACP() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	ag := agent.New()
+	var g *genkit.Genkit
+	var models []agent.Model
 	if cfg, err := loadModelConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "gca: %v\n", err)
 		os.Exit(1)
@@ -68,12 +69,12 @@ func runACP() {
 			wires = append(wires, w)
 			plugins = append(plugins, w.plugin)
 		}
-		g := genkit.Init(ctx, genkit.WithPlugins(plugins...))
+		g = genkit.Init(ctx, genkit.WithPlugins(plugins...))
 
 		// Every configured model becomes a value of the model config option,
 		// in config order, so the first one is both a new session's default
 		// and what Config.Active names.
-		models := make([]agent.Model, 0, len(cfg.Provider))
+		models = make([]agent.Model, 0, len(cfg.Provider))
 		for i, p := range cfg.Provider {
 			for _, m := range p.Model {
 				models = append(models, agent.Model{
@@ -84,8 +85,8 @@ func runACP() {
 				})
 			}
 		}
-		ag.SetModels(g, models)
 	}
+	ag := agent.New(g, models)
 
 	conn := acp.NewAgentSideConnection(ag, os.Stdout, os.Stdin)
 	conn.SetLogger(slog.Default())

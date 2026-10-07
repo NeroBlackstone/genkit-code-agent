@@ -52,7 +52,9 @@ Model config lives at `~/.gca/gca.json`:
 
 ## Sessions
 
-Sessions live in memory only. The agent advertises `session/resume` (not `session/load`): a client reopening a thread names the session id, and an id it does not know is registered on the spot with the default model, so prompts continue without any history replay. Nothing survives a restart of `gca`; `session/load` with a replayed conversation is left for when sessions are persisted.
+A conversation lives in the store, not in the process: `~/.gca/workspaces/<cwd hash>/sessions/<id>.json` holds the whole transcript as one JSON envelope, and each turn reads it, sends it to the model, and writes it back with the new exchange appended. What `gca` keeps in memory is only what a running process needs — the session id's workspace, its model selection, and the handle to a turn in flight — so nothing has to be rebuilt after a restart: an id from before the restart resumes with its model and its conversation.
+
+Both `session/resume` (continue without a replay) and `session/load` (stream the stored conversation back as notifications) are served from that file. A workspace that cannot be opened leaves sessions running turn by turn with no history, and a stored file that cannot be read is quarantined aside as `.bak` rather than overwritten.
 
 ## Supported providers
 

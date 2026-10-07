@@ -29,30 +29,56 @@ type Model struct {
 	Config any
 }
 
+// Session is one conversation's live state. Its content is not here: the
+// transcript lives in the store, which is the single source of truth, and is
+// read and written around each turn. What stays in memory is what a running
+// process must hold: where to find the conversation, which model it runs, and
+// the handle to the turn in flight.
 type Session struct {
-	Cancel context.CancelFunc
+	// turn serializes this session's load -> generate -> save pipeline. A
+	// prompt holds it for the whole turn, so a later one cannot read a
+	// transcript the earlier has not written back yet. Cancel never takes
+	// it: interrupting a turn must not queue behind it.
+	turn sync.Mutex
+
+	// mu guards the fields below. It is never held across a store read, a
+	// model call, or a wait on turn.
+	mu sync.Mutex
+	// cancel stops the turn currently running on this session, if any.
+	cancel context.CancelFunc
+	// turnSeq numbers the turns that claim cancel, so a turn superseded by a
+	// newer one clears nothing but its own handle on the way out.
+	turnSeq int
 	// model is the ref of the model this session runs, taken from the model
 	// config option and defaulting to the first configured model.
 	model string
-	// ws persists this session's transcript, nil when the cwd gave no
-	// workspace to write to.
-	ws *store.Workspace
-	// meta is the stored envelope's metadata, refreshed on every save.
-	meta store.SessionMeta
-	// transcript is the full conversation, oldest first, guarded by
-	// Agent.mu and written to disk after every successful turn. Only its
-	// most recent window is ever replayed to the model; session/load can
-	// replay all of it.
-	transcript []*ai.Message
+
+	// ws is this session's workspace, nil when the cwd gave no workspace to
+	// store a conversation in; a session without one runs turn by turn with
+	// no history, there being nowhere to keep it. ready is closed once ws and
+	// the stored model are settled, and every path that hands out this
+	// session waits on it first, which is what lets ws go without a lock.
+	ws    *store.Workspace
+	ready chan struct{}
+
+	// cwd is the working directory the session was opened with. Tools
+	// resolve relative paths against it; like ws it is settled before ready
+	// closes, so it needs no lock.
+	cwd string
 }
 
 type Agent struct {
 	conn     *acp.AgentSideConnection
 	sessions map[string]*Session
-	mu       sync.Mutex
+	// mu guards the sessions map, and only the map: no store or model work
+	// is done under it, so an unrelated session never waits on this lock.
+	mu sync.RWMutex
 
 	g      *genkit.Genkit
 	models []Model
+	// tools are the tools this agent offers the model, registered on g when
+	// one is wired and empty otherwise.
+	tools []ai.ToolRef
 }
 
 var (
@@ -60,20 +86,23 @@ var (
 	_ acp.AgentLoader = (*Agent)(nil)
 )
 
-func New() *Agent {
-	return &Agent{sessions: make(map[string]*Session)}
+// New wires the genkit instance and the models runTurn picks from: they become
+// the model config option, and the first one is a new session's value. A nil g
+// with no models leaves the agent falling back to echoing the prompt.
+func New(g *genkit.Genkit, models []Model) *Agent {
+	return &Agent{
+		sessions: make(map[string]*Session),
+		g:        g,
+		models:   models,
+		tools:    defineTools(g),
+	}
 }
 
+// SetAgentConnection injects the connection updates are sent over. It cannot
+// ride New because the connection is built around the agent itself; every path
+// that sends an update must run after it.
 func (a *Agent) SetAgentConnection(conn *acp.AgentSideConnection) {
 	a.conn = conn
-}
-
-// SetModels wires the genkit instance and the models runTurn picks from: they
-// become the model config option, and the first one is a new session's value.
-// Without it the agent falls back to echoing the prompt.
-func (a *Agent) SetModels(g *genkit.Genkit, models []Model) {
-	a.g = g
-	a.models = models
 }
 
 func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
@@ -106,29 +135,30 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	s := a.openSession(sid, params.Cwd)
 	return acp.NewSessionResponse{
 		SessionId:     acp.SessionId(sid),
-		ConfigOptions: a.configOptions(s.model),
+		ConfigOptions: a.configOptions(s.currentModel()),
 	}, nil
 }
 
 // ResumeSession continues a session by the id the client names, without
-// replaying history, which is what the resume capability promises. A stored
-// transcript for that id is still loaded, so an id from before this process
-// started keeps its conversation and the model it ran on; an unknown id is
-// registered here with the default model.
+// replaying history, which is what the resume capability promises. The model
+// the session last ran on comes back with it, an id from before this process
+// started included; an unknown id is registered here with the default model
+// and picks up its stored conversation on the next turn.
 func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
 	s := a.openSession(string(params.SessionId), params.Cwd)
-	return acp.ResumeSessionResponse{ConfigOptions: a.configOptions(s.model)}, nil
+	return acp.ResumeSessionResponse{ConfigOptions: a.configOptions(s.currentModel())}, nil
 }
 
 // LoadSession restores a stored session and streams its whole transcript back
 // to the client as notifications, which is what session/load asks the agent
-// to do now that transcripts live on disk.
+// to do. The transcript is read from the store here rather than from memory,
+// so a session loaded without ever being prompted replays just the same.
 func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	s := a.openSession(string(params.SessionId), params.Cwd)
-	a.mu.Lock()
-	msgs := append([]*ai.Message(nil), s.transcript...)
-	model := s.model
-	a.mu.Unlock()
+	msgs, _, err := s.load(string(params.SessionId))
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
 	for _, m := range msgs {
 		for _, update := range updatesForReplay(m) {
 			if err := a.sendUpdate(ctx, params.SessionId, update); err != nil {
@@ -136,53 +166,71 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 			}
 		}
 	}
-	return acp.LoadSessionResponse{ConfigOptions: a.configOptions(model)}, nil
+	return acp.LoadSessionResponse{ConfigOptions: a.configOptions(s.currentModel())}, nil
 }
 
 // openSession returns the session for sid, registering it with the default
-// model first when it is not registered yet, and adopting the transcript
-// stored for it in cwd's workspace when one exists.
+// model first when it is not registered yet, and pointing it at the workspace
+// stored for it in cwd. The workspace is attached off Agent.mu: opening one
+// reads the disk, and a prompt on another session must not wait on it.
 func (a *Agent) openSession(sid, cwd string) *Session {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if s, ok := a.sessions[sid]; ok {
+		a.mu.Unlock()
+		<-s.ready
 		return s
 	}
-	s := &Session{}
+	s := &Session{ready: make(chan struct{}), cwd: cwd}
 	if len(a.models) > 0 {
 		s.model = a.models[0].Ref
 	}
+	a.sessions[sid] = s
+	a.mu.Unlock()
+
+	// Closing ready releases every caller waiting on this session, so it
+	// must happen whatever attachStore concludes.
+	defer close(s.ready)
 	if cwd != "" {
 		a.attachStore(s, sid, cwd)
 	}
-	a.sessions[sid] = s
 	return s
 }
 
-// attachStore opens cwd's workspace and, when a stored transcript for sid
-// exists, adopts it along with the model that session ran on. Callers hold
-// a.mu. A workspace that cannot be opened leaves the session in memory only;
-// a transcript that cannot be read is reported and skipped, the file having
+// get returns the session registered under sid, once its workspace is
+// attached, or reports that no session is registered for it.
+func (a *Agent) get(sid string) (*Session, bool) {
+	a.mu.RLock()
+	s, ok := a.sessions[sid]
+	a.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	<-s.ready
+	return s, true
+}
+
+// attachStore opens cwd's workspace and takes from it the model the session
+// last ran on. The transcript itself is deliberately left on disk: it is read
+// by the turn and the replay that need it, never cached here. A workspace
+// that cannot be opened leaves the session running without history, and a
+// stored session that cannot be read keeps the default model, the file having
 // been quarantined by the store.
 func (a *Agent) attachStore(s *Session, sid, cwd string) {
 	ws, err := store.Open(cwd)
 	if err != nil {
-		slog.Warn("workspace unavailable, session will not persist", "cwd", cwd, "error", err)
+		slog.Warn("workspace unavailable, sessions will run without history", "cwd", cwd, "error", err)
 		return
 	}
 	s.ws = ws
-	msgs, meta, err := ws.Load(sid)
+	_, meta, err := ws.Load(sid)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		// A new session: nothing stored yet, which is the normal case.
 		return
 	case err != nil:
-		// Quarantined or unreadable: keep the session, start the transcript
-		// empty, and say so; the store preserved the original bytes.
-		slog.Warn("stored transcript unusable, starting empty", "session", sid, "error", err)
+		slog.Warn("stored session unusable, keeping the default model", "session", sid, "error", err)
 		return
 	}
-	s.transcript, s.meta = msgs, meta
 	if meta.Model != "" {
 		if _, ok := a.modelFor(meta.Model); ok {
 			s.model = meta.Model
@@ -190,17 +238,36 @@ func (a *Agent) attachStore(s *Session, sid, cwd string) {
 	}
 }
 
+// load reads this session's transcript from the store, the only place a
+// conversation exists. A session with no workspace has no history, and a
+// session nothing was ever saved for is the same case rather than an error.
+// Any other failure is returned instead of falling back to an empty
+// conversation: starting empty here would mean saving over a file that may
+// still hold the real one.
+func (s *Session) load(sid string) ([]*ai.Message, store.SessionMeta, error) {
+	if s.ws == nil {
+		return nil, store.SessionMeta{}, nil
+	}
+	msgs, meta, err := s.ws.Load(sid)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, store.SessionMeta{}, nil
+	case err != nil:
+		return nil, store.SessionMeta{}, fmt.Errorf("read stored transcript for %s: %w", sid, err)
+	}
+	return msgs, meta, nil
+}
+
+// currentModel returns the model this session runs.
+func (s *Session) currentModel() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model
+}
+
 func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
 	sid := string(params.SessionId)
-	a.mu.Lock()
-	s, ok := a.sessions[sid]
-	var modelRef string
-	if ok {
-		// Taken now so a selection made while this turn runs applies to the
-		// next one rather than switching models mid-generation.
-		modelRef = s.model
-	}
-	a.mu.Unlock()
+	s, ok := a.get(sid)
 	if !ok {
 		return acp.PromptResponse{}, fmt.Errorf("session %s not found", sid)
 	}
@@ -213,18 +280,30 @@ func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 		userMsgID = *params.MessageId
 	}
 
-	if s.Cancel != nil {
-		s.Cancel()
+	// Claim the session before waiting for the turn lock: the turn already
+	// running is cancelled first, so it unwinds instead of holding the
+	// pipeline this one is about to enter. The sequence number marks the
+	// handle as ours, so the superseded turn cannot clear it on its way out.
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
 	}
+	s.turnSeq++
+	seq := s.turnSeq
 	turnCtx, cancel := context.WithCancel(ctx)
-	a.mu.Lock()
-	s.Cancel = cancel
-	a.mu.Unlock()
+	s.cancel = cancel
+	// Taken now so a selection made while this turn runs applies to the next
+	// one rather than switching models mid-generation.
+	modelRef := s.model
+	s.mu.Unlock()
+
 	defer func() {
 		cancel()
-		a.mu.Lock()
-		s.Cancel = nil
-		a.mu.Unlock()
+		s.mu.Lock()
+		if s.turnSeq == seq {
+			s.cancel = nil
+		}
+		s.mu.Unlock()
 	}()
 
 	if err := a.runTurn(turnCtx, params, s, modelRef, userMsgID); err != nil {
@@ -237,11 +316,12 @@ func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 }
 
 func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error {
-	a.mu.Lock()
-	s, ok := a.sessions[string(params.SessionId)]
-	a.mu.Unlock()
-	if ok && s.Cancel != nil {
-		s.Cancel()
+	if s, ok := a.get(string(params.SessionId)); ok {
+		s.mu.Lock()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -255,15 +335,24 @@ func (a *Agent) Logout(ctx context.Context, params acp.LogoutRequest) (acp.Logou
 }
 
 func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	sid := string(params.SessionId)
-	if s, ok := a.sessions[sid]; ok {
-		if s.Cancel != nil {
-			s.Cancel()
-		}
+	a.mu.Lock()
+	s, ok := a.sessions[sid]
+	if ok {
 		delete(a.sessions, sid)
 	}
+	a.mu.Unlock()
+	if !ok {
+		return acp.CloseSessionResponse{}, nil
+	}
+	// Stopping the turn in flight is all close does to it: the conversation
+	// is on disk and stays there, waiting to be resumed.
+	<-s.ready
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.mu.Unlock()
 	return acp.CloseSessionResponse{}, nil
 }
 
@@ -280,13 +369,6 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	if params.ValueId == nil {
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("unsupported config option type")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	sid := string(params.ValueId.SessionId)
-	s, ok := a.sessions[sid]
-	if !ok {
-		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("session %s not found", sid)
-	}
 	if params.ValueId.ConfigId != modelConfigOptionID {
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("unknown config option %q", params.ValueId.ConfigId)
 	}
@@ -294,6 +376,12 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	if _, ok := a.modelFor(value); !ok {
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("unknown model %q", value)
 	}
+	s, ok := a.get(string(params.ValueId.SessionId))
+	if !ok {
+		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("session %s not found", params.ValueId.SessionId)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.model = value
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: a.configOptions(s.model)}, nil
 }

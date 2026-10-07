@@ -29,8 +29,7 @@ func modelOption(t *testing.T, options []acp.SessionConfigOption) *acp.SessionCo
 
 func TestNewSessionOffersModelOption(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
-	ag := New()
-	ag.SetModels(nil, testModels())
+	ag := New(nil, testModels())
 
 	resp, err := ag.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
 	if err != nil {
@@ -66,7 +65,7 @@ func TestNewSessionOffersModelOption(t *testing.T) {
 
 func TestNewSessionWithoutModels(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
-	resp, err := New().NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
+	resp, err := New(nil, nil).NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
@@ -77,8 +76,7 @@ func TestNewSessionWithoutModels(t *testing.T) {
 
 func TestSetSessionConfigOption(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
-	ag := New()
-	ag.SetModels(nil, testModels())
+	ag := New(nil, testModels())
 	resp, err := ag.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
 	if err != nil {
 		t.Fatalf("new session: %v", err)
@@ -104,7 +102,11 @@ func TestSetSessionConfigOption(t *testing.T) {
 		if sel.CurrentValue != "openai/gpt-4o" {
 			t.Errorf("current value = %q, want openai/gpt-4o", sel.CurrentValue)
 		}
-		if got := ag.sessions[string(resp.SessionId)].model; got != "openai/gpt-4o" {
+		s, ok := ag.get(string(resp.SessionId))
+		if !ok {
+			t.Fatal("session not registered")
+		}
+		if got := s.currentModel(); got != "openai/gpt-4o" {
 			t.Errorf("session model = %q, want openai/gpt-4o", got)
 		}
 	})
@@ -130,8 +132,7 @@ func TestSetSessionConfigOption(t *testing.T) {
 
 func TestResumeSessionAdoptsClientID(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
-	ag := New()
-	ag.SetModels(nil, testModels())
+	ag := New(nil, testModels())
 
 	out, err := ag.ResumeSession(context.Background(), acp.ResumeSessionRequest{
 		SessionId: "sess_from_before_restart",
@@ -152,8 +153,7 @@ func TestResumeSessionAdoptsClientID(t *testing.T) {
 
 func TestResumeSessionKeepsModelSelection(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // keep the session store out of the real ~/.gca
-	ag := New()
-	ag.SetModels(nil, testModels())
+	ag := New(nil, testModels())
 	resp, err := ag.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
 	if err != nil {
 		t.Fatalf("new session: %v", err)
