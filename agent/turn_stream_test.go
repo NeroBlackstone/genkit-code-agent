@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,11 +35,45 @@ type streamEvent struct {
 // disk.
 type recordingClient struct {
 	testClient
-	events     []streamEvent
-	toolCalls  []acp.SessionUpdateToolCall
-	toolEvents []acp.SessionUpdate
-	writes     []acp.WriteTextFileRequest
-	reads      []acp.ReadTextFileRequest
+	events      []streamEvent
+	toolCalls   []acp.SessionUpdateToolCall
+	toolEvents  []acp.SessionUpdate
+	writes      []acp.WriteTextFileRequest
+	reads       []acp.ReadTextFileRequest
+	permissions []acp.RequestPermissionRequest
+	permission  func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
+}
+
+// RequestPermission records the agent's session/request_permission and
+// answers it: with whatever the test wired into permission, or allow-once
+// when it wired nothing — a user who approves what the model asks for,
+// which is the baseline every tool test runs on now that approval gates
+// every call.
+func (c *recordingClient) RequestPermission(ctx context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	c.testClient.mu.Lock()
+	c.permissions = append(c.permissions, p)
+	answer := c.permission
+	c.testClient.mu.Unlock()
+	if answer != nil {
+		return answer(ctx, p)
+	}
+	return selectPermission(permissionAllowOnce), nil
+}
+
+// permissionRequests returns the prompts the agent sent so far, in order.
+func (c *recordingClient) permissionRequests() []acp.RequestPermissionRequest {
+	c.testClient.mu.Lock()
+	defer c.testClient.mu.Unlock()
+	return append([]acp.RequestPermissionRequest(nil), c.permissions...)
+}
+
+// selectPermission builds the response a user picking option makes.
+func selectPermission(option acp.PermissionOptionId) acp.RequestPermissionResponse {
+	return acp.RequestPermissionResponse{
+		Outcome: acp.RequestPermissionOutcome{
+			Selected: &acp.RequestPermissionOutcomeSelected{OptionId: option},
+		},
+	}
 }
 
 func (c *recordingClient) WriteTextFile(_ context.Context, p acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {

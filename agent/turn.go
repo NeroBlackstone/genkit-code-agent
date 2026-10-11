@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"uuid"
@@ -20,6 +21,44 @@ answering technical questions. Use the read tool to inspect files and the write 
 to create or overwrite files. Be direct and concise. When you change code,
 follow the existing project conventions. Never invent file paths or APIs: verify
 them before referring to them.`
+
+func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+	sid := string(params.SessionId)
+	s, ok := a.get(sid)
+	if !ok {
+		return acp.PromptResponse{}, fmt.Errorf("session %s not found", sid)
+	}
+
+	// The id this turn's user message goes under: the client's own when it
+	// named one, ours otherwise, so the response can always echo an id and
+	// the turn can stamp it into the stored transcript either way.
+	userMsgID := uuid.New().String()
+	if params.MessageId != nil && *params.MessageId != "" {
+		userMsgID = *params.MessageId
+	}
+
+	turnCtx, modelRef, release := s.claimTurn(ctx)
+	defer release()
+
+	if err := a.runTurn(turnCtx, params, s, modelRef, userMsgID); err != nil {
+		// A cancelled turn reports stopReason cancelled rather than
+		// failing: the protocol ties cancellation to a prompt the client
+		// itself stopped, and a permission outcome of the same name ends
+		// the turn the same way — with nothing run and nothing stored.
+		if turnCtx.Err() != nil || errors.Is(err, errPermissionCancelled) {
+			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: &userMsgID}, nil
+		}
+		return acp.PromptResponse{}, err
+	}
+	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn, UserMessageId: &userMsgID}, nil
+}
+
+func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error {
+	if s, ok := a.get(string(params.SessionId)); ok {
+		s.cancelTurn()
+	}
+	return nil
+}
 
 // runTurn answers one prompt on the model the session selected, falling back
 // to echoing when no model was configured. The conversation is read from the
@@ -63,34 +102,76 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 	// The turn's tools get their environment here: the session cwd relative
 	// paths resolve against, and the reader and writer that take files to
 	// and from this client over fs/read_text_file and fs/write_text_file,
-	// or none when the client cannot take them.
-	resp, err := genkit.Generate(withToolEnv(ctx, toolEnv{
+	// or none when the client cannot take them. The same context carries
+	// the resume below, so the tools re-run under approval have the same
+	// environment as the ones the first call ran.
+	envCtx := withToolEnv(ctx, toolEnv{
 		cwd:   s.cwd,
 		read:  a.readerFor(string(params.SessionId)),
 		write: a.writerFor(string(params.SessionId)),
-	}), a.g,
+	})
+
+	stream := func(ctx context.Context, chunk *ai.ModelResponseChunk) error {
+		for _, part := range chunk.Content {
+			update, ok := updateForPart(part, messageID)
+			if !ok {
+				continue
+			}
+			if err := a.sendUpdate(ctx, params.SessionId, update); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	resp, err := genkit.Generate(envCtx, a.g,
 		ai.WithModel(ai.NewModelRef(model.Ref, model.Config)),
 		ai.WithSystem(systemPrompt),
 		ai.WithMessages(history...),
 		ai.WithPrompt(userText),
 		ai.WithTools(a.tools...),
-		// The client hears about each tool call the moment the model
-		// requests it, pending and before execution, through the reporter's
-		// WrapModel hook; its Ref becomes the id later updates arrive on.
-		ai.WithUse(toolCallReporter{agent: a, sid: params.SessionId, cwd: s.cwd}),
-		ai.WithStreaming(func(ctx context.Context, chunk *ai.ModelResponseChunk) error {
-			for _, part := range chunk.Content {
-				update, ok := updateForPart(part, messageID)
-				if !ok {
-					continue
-				}
-				if err := a.sendUpdate(ctx, params.SessionId, update); err != nil {
-					return err
-				}
-			}
-			return nil
-		}),
+		// The bundle leads with the approval gate: the client hears about
+		// each tool call through the reporter's WrapModel hook the moment
+		// the model requests it, pending and before execution, but a call
+		// the gate holds never reaches the reporter's WrapTool — it stays
+		// pending until the resume either runs it or answers it.
+		ai.WithUse(a.turnMiddleware(s, params.SessionId)...),
+		ai.WithStreaming(stream),
 	)
+	if err != nil {
+		return err
+	}
+
+	// A held tool ends the call with FinishReason interrupted and its
+	// requests unexecuted. The approval loop puts each one to the client
+	// over session/request_permission and runs Generate again over the
+	// same conversation with the decisions attached, until the model
+	// stops pausing; what follows only ever sees a finished turn.
+	resp, err = a.resolveInterrupts(envCtx, resp, params.SessionId, s,
+		func(cur *ai.ModelResponse, restarts, responds []*ai.Part) (*ai.ModelResponse, error) {
+			msgs := cur.History()
+			// The system prompt re-travels as WithSystem rather than as
+			// the history message it already is: doubling it would put
+			// two system messages in front of the provider.
+			if len(msgs) > 0 && msgs[0].Role == ai.RoleSystem {
+				msgs = msgs[1:]
+			}
+			return genkit.Generate(envCtx, a.g,
+				ai.WithModel(ai.NewModelRef(model.Ref, model.Config)),
+				ai.WithSystem(systemPrompt),
+				ai.WithMessages(msgs...),
+				ai.WithTools(a.tools...),
+				// The same middleware the first call carried, rebuilt so
+				// an allow_always answered earlier this turn is in the
+				// gate before this call's own tool rounds run: resume
+				// keeps the same config as the call it resumes, plus
+				// whatever the session has remembered since.
+				ai.WithUse(a.turnMiddleware(s, params.SessionId)...),
+				ai.WithStreaming(stream),
+				ai.WithToolRestarts(restarts...),
+				ai.WithToolResponses(responds...),
+			)
+		})
 	if err != nil {
 		return err
 	}
@@ -199,7 +280,15 @@ func updatesForReplay(m *ai.Message, cwd string) []acp.SessionUpdate {
 			if part == nil || part.ToolResponse == nil || part.ToolResponse.Ref == "" {
 				continue
 			}
-			out = append(out, toolCallOutcome(part.ToolResponse.Ref, acp.ToolCallStatusCompleted, part.ToolResponse.Output))
+			// A response the agent answered on the user's refusal carries
+			// the interruptResponse marker Respond stamps; it replays as
+			// the failed the live turn reported, not as a run that
+			// completed.
+			status := acp.ToolCallStatusCompleted
+			if part.Metadata["interruptResponse"] != nil {
+				status = acp.ToolCallStatusFailed
+			}
+			out = append(out, toolCallOutcome(part.ToolResponse.Ref, status, part.ToolResponse.Output))
 		}
 		return out
 	}

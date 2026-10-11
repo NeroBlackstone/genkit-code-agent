@@ -56,6 +56,12 @@ A conversation lives in the store, not in the process: `~/.gca/workspaces/<cwd h
 
 Both `session/resume` (continue without a replay) and `session/load` (stream the stored conversation back as notifications) are served from that file. A workspace that cannot be opened leaves sessions running turn by turn with no history, and a stored file that cannot be read is quarantined aside as `.bak` rather than overwritten.
 
+## Tool approval
+
+Every tool call is gated: the model's request is held until the client answers `session/request_permission`, which the agent asks with the four outcomes the protocol defines — allow once, always allow, reject once, always reject. The two `once` choices resolve only the call they answer; the two `always` choices are remembered on the session, in memory only — nothing is written to the store or to `gca.json`, so a new session or a restarted agent asks again.
+
+A held call stays `pending` under the `toolCallId` its creating update was filed with, then runs to `completed` — or closes as `failed` with the refusal — under that same id once the answer arrives. A refusal is answered to the model as a tool response rather than left hanging, so the turn still finishes on a complete conversation, and a `cancelled` outcome ends the prompt turn with `stopReason: "cancelled"`, storing nothing. A client that never answers `session/request_permission` fails the turn rather than letting a tool run unasked.
+
 ## Supported providers
 
 Dedicated plugins under `github.com/firebase/genkit/go/plugins/compat_oai/`:

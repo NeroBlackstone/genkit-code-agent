@@ -79,6 +79,14 @@ func (r toolCallReporter) wrapTool(ctx context.Context, params *ai.ToolParams, n
 	}
 	resp, err := next(ctx, params)
 	if err != nil {
+		if held, _ := ai.IsToolInterruptError(err); held {
+			// Held, not failed: the call comes back through a resume that
+			// either runs it (and this hook reports the run then) or
+			// answers it (and the approval loop closes it). Marking it
+			// failed here would close a call that is about to reopen under
+			// the same id, so the client keeps the pending it has.
+			return resp, err
+		}
 		// The tool's own error is what the turn fails on; the report of it
 		// rides along, dropped only when it cannot be sent either.
 		_ = r.agent.sendUpdate(ctx, r.sid, toolCallOutcome(ref, acp.ToolCallStatusFailed, err.Error()))
