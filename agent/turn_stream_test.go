@@ -35,9 +35,11 @@ type streamEvent struct {
 // disk.
 type recordingClient struct {
 	testClient
-	events []streamEvent
-	writes []acp.WriteTextFileRequest
-	reads  []acp.ReadTextFileRequest
+	events     []streamEvent
+	toolCalls  []acp.SessionUpdateToolCall
+	toolEvents []acp.SessionUpdate
+	writes     []acp.WriteTextFileRequest
+	reads      []acp.ReadTextFileRequest
 }
 
 func (c *recordingClient) WriteTextFile(_ context.Context, p acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
@@ -68,10 +70,33 @@ func (c *recordingClient) fsReads() []acp.ReadTextFileRequest {
 	return append([]acp.ReadTextFileRequest(nil), c.reads...)
 }
 
+// toolCallUpdates returns the tool_call updates recorded so far, in arrival
+// order, which is what tells a test what the client learned about the
+// model's tool requests at the creating end.
+func (c *recordingClient) toolCallUpdates() []acp.SessionUpdateToolCall {
+	c.testClient.mu.Lock()
+	defer c.testClient.mu.Unlock()
+	return append([]acp.SessionUpdateToolCall(nil), c.toolCalls...)
+}
+
+// toolCallEvents returns every tool-carrying update in arrival order, the
+// creates and the tool_call_updates that follow them alike, which is the
+// sequence the client sees one call's lifecycle in.
+func (c *recordingClient) toolCallEvents() []acp.SessionUpdate {
+	c.testClient.mu.Lock()
+	defer c.testClient.mu.Unlock()
+	return append([]acp.SessionUpdate(nil), c.toolEvents...)
+}
+
 func (c *recordingClient) SessionUpdate(_ context.Context, p acp.SessionNotification) error {
 	c.testClient.mu.Lock()
 	defer c.testClient.mu.Unlock()
 	switch {
+	case p.Update.ToolCall != nil:
+		c.toolCalls = append(c.toolCalls, *p.Update.ToolCall)
+		c.toolEvents = append(c.toolEvents, p.Update)
+	case p.Update.ToolCallUpdate != nil:
+		c.toolEvents = append(c.toolEvents, p.Update)
 	case p.Update.UserMessageChunk != nil && p.Update.UserMessageChunk.Content.Text != nil:
 		id := ""
 		if p.Update.UserMessageChunk.MessageId != nil {

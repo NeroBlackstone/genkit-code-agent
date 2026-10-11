@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -226,6 +227,166 @@ func TestLoadSessionReplaysTranscript(t *testing.T) {
 	}
 	if !strings.HasPrefix(events[1].MessageID, "msg_") || events[3].MessageID == events[1].MessageID {
 		t.Errorf("answer ids = %q, %q, want distinct msg_ ids per turn", events[1].MessageID, events[3].MessageID)
+	}
+}
+
+// TestLoadSessionReplaysToolCall drives a tool round through one agent,
+// throws it away, and replays the session on a second: the call the first
+// turn reported live — created pending, closed completed under the same id —
+// must come back as the same pending tool_call plus the same closing update,
+// under the id it was stored with, so a loaded session shows the tools it ran
+// and what they returned rather than only its text.
+func TestLoadSessionReplaysToolCall(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	relative := filepath.Join("src", "main.go")
+	wantPath := filepath.Join(cwd, relative)
+	requests := startToolModel(t, "read", fmt.Sprintf(`{"filePath":%q}`, relative), "the file is read")
+
+	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	_, client1, conn1, rc1 := openAgentPipes(t, g, fakeModel())
+	sess, err := client1.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if _, err := client1.Prompt(ctx, acp.PromptRequest{
+		SessionId: sess.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("show me main.go")},
+	}); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	_ = conn1.Done()
+	_ = client1.Done()
+
+	if got := len(requests()); got != 2 {
+		t.Fatalf("model requests = %d, want 2 (tool call round)", got)
+	}
+	live := rc1.toolCallUpdates()
+	if len(live) != 1 {
+		t.Fatalf("live tool_call updates = %d, want 1", len(live))
+	}
+	// The live turn closed its own call: pending, then in_progress, then
+	// completed under one id, with the tool's output as the raw output.
+	liveEvents := rc1.toolCallEvents()
+	if len(liveEvents) != 3 {
+		t.Fatalf("live tool call updates = %d (%+v), want creating, in_progress, completed", len(liveEvents), liveEvents)
+	}
+	wantLive := []acp.ToolCallStatus{
+		acp.ToolCallStatusPending, acp.ToolCallStatusInProgress, acp.ToolCallStatusCompleted,
+	}
+	for i, want := range wantLive {
+		if got := statusOf(liveEvents[i]); got != want {
+			t.Errorf("live update %d status = %q, want %q", i, got, want)
+		}
+	}
+	liveOutcome := liveEvents[2].ToolCallUpdate
+	if liveOutcome == nil || liveOutcome.ToolCallId != live[0].ToolCallId {
+		t.Fatalf("live outcome = %+v, want it filed under %q", liveEvents[2], live[0].ToolCallId)
+	}
+	if s, _ := liveOutcome.RawOutput.(string); !strings.Contains(s, "the client does not support fs/read_text_file") {
+		t.Errorf("live rawOutput = %#v, want the output the model read back", liveOutcome.RawOutput)
+	}
+
+	// A fresh agent knows nothing but the cwd and the session id.
+	ag2, client2, conn2, rc2 := openAgentPipes(t, g, fakeModel())
+	if _, err := client2.LoadSession(ctx, acp.LoadSessionRequest{
+		SessionId:  sess.SessionId,
+		Cwd:        cwd,
+		McpServers: []acp.McpServer{},
+	}); err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	_ = conn2.Done()
+	_ = client2.Done()
+
+	replayed := rc2.toolCallUpdates()
+	if len(replayed) != 1 {
+		t.Fatalf("replayed tool_call updates = %+v, want exactly one", replayed)
+	}
+	got := replayed[0]
+	if got.ToolCallId != live[0].ToolCallId {
+		t.Errorf("replayed toolCallId = %q, want the live turn's %q", got.ToolCallId, live[0].ToolCallId)
+	}
+	if got.Status != acp.ToolCallStatusPending {
+		t.Errorf("status = %q, want pending", got.Status)
+	}
+	if got.Kind != acp.ToolKindRead {
+		t.Errorf("kind = %q, want read", got.Kind)
+	}
+	if want := "Reading " + wantPath; got.Title != want {
+		t.Errorf("title = %q, want %q", got.Title, want)
+	}
+	if len(got.Locations) != 1 || got.Locations[0].Path != wantPath {
+		t.Errorf("locations = %+v, want one entry for %q", got.Locations, wantPath)
+	}
+	raw, ok := got.RawInput.(map[string]any)
+	if !ok || raw["filePath"] != relative {
+		t.Errorf("rawInput = %#v, want the model's own arguments", got.RawInput)
+	}
+
+	// The id it was replayed under is the one the transcript holds: that
+	// equality is what lets a later update find the call again.
+	s2, ok := ag2.get(string(sess.SessionId))
+	if !ok {
+		t.Fatal("loaded session not registered")
+	}
+	stored, _, err := s2.load(string(sess.SessionId))
+	if err != nil {
+		t.Fatalf("read stored transcript: %v", err)
+	}
+	var storedRef string
+	for _, m := range stored {
+		for _, p := range m.Content {
+			if p.IsToolRequest() && p.ToolRequest != nil {
+				storedRef = p.ToolRequest.Ref
+			}
+		}
+	}
+	if storedRef == "" {
+		t.Fatal("stored transcript holds no tool request")
+	}
+	if string(got.ToolCallId) != storedRef {
+		t.Errorf("replayed toolCallId = %q, want the stored ref %q", got.ToolCallId, storedRef)
+	}
+
+	// The replay closes the call the way the live turn did: the creating
+	// update, then completed under the same id carrying the stored output.
+	// The in_progress between them was live progress, which the transcript
+	// never held, so the replay runs the call pending straight to completed.
+	loadEvents := rc2.toolCallEvents()
+	if len(loadEvents) != 2 {
+		t.Fatalf("replayed tool call updates = %d (%+v), want creating and completed", len(loadEvents), loadEvents)
+	}
+	if statusOf(loadEvents[0]) != acp.ToolCallStatusPending {
+		t.Errorf("first replayed status = %q, want pending", statusOf(loadEvents[0]))
+	}
+	outcome := loadEvents[1].ToolCallUpdate
+	if outcome == nil {
+		t.Fatalf("second replayed update = %+v, want a tool_call_update", loadEvents[1])
+	}
+	if outcome.ToolCallId != live[0].ToolCallId {
+		t.Errorf("replayed outcome id = %q, want the live turn's %q", outcome.ToolCallId, live[0].ToolCallId)
+	}
+	if outcome.Status == nil || *outcome.Status != acp.ToolCallStatusCompleted {
+		t.Errorf("replayed outcome status = %v, want completed", outcome.Status)
+	}
+	if outcome.RawOutput != liveOutcome.RawOutput {
+		t.Errorf("replayed rawOutput = %#v, want the live turn's %#v", outcome.RawOutput, liveOutcome.RawOutput)
+	}
+
+	// The text around the call replays with it.
+	rc2.testClient.mu.Lock()
+	events := append([]streamEvent(nil), rc2.events...)
+	rc2.testClient.mu.Unlock()
+	if want, got := "show me main.go", joined(events, "user"); want != got {
+		t.Errorf("replayed prompt = %q, want %q", got, want)
+	}
+	if want, got := "the file is read", joined(events, "message"); want != got {
+		t.Errorf("replayed answer = %q, want %q", got, want)
 	}
 }
 

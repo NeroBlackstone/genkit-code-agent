@@ -74,6 +74,10 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 		ai.WithMessages(history...),
 		ai.WithPrompt(userText),
 		ai.WithTools(a.tools...),
+		// The client hears about each tool call the moment the model
+		// requests it, pending and before execution, through the reporter's
+		// WrapModel hook; its Ref becomes the id later updates arrive on.
+		ai.WithUse(toolCallReporter{agent: a, sid: params.SessionId, cwd: s.cwd}),
 		ai.WithStreaming(func(ctx context.Context, chunk *ai.ModelResponseChunk) error {
 			for _, part := range chunk.Content {
 				update, ok := updateForPart(part, messageID)
@@ -137,10 +141,15 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 
 // updatesForReplay turns one stored message back into the ACP updates its
 // original turn streamed: user text as user_message_chunk, an answer's
-// reasoning first and then its text, each carrying the id it was saved under
-// so the client regroups the replay exactly as the live turn was grouped.
-// A message stored before ids existed gets a fresh one for the replay.
-func updatesForReplay(m *ai.Message) []acp.SessionUpdate {
+// reasoning first and then its text, a model message's tool requests as the
+// tool_call updates the reporter sent when it saw them, and a tool message's
+// responses as the tool_call_update that closed each call, all carrying the
+// ids they were saved under so the client regroups the replay exactly as the
+// live turn was grouped. The live turn's in_progress update has no stored
+// counterpart — the transcript holds results, not progress — so a replay runs
+// a call straight from pending to its stored outcome. A message stored before
+// ids existed gets a fresh one for the replay.
+func updatesForReplay(m *ai.Message, cwd string) []acp.SessionUpdate {
 	if m == nil {
 		return nil
 	}
@@ -166,9 +175,31 @@ func updatesForReplay(m *ai.Message) []acp.SessionUpdate {
 		}
 		var out []acp.SessionUpdate
 		for _, part := range m.Content {
+			if part != nil && part.IsToolRequest() && part.ToolRequest != nil {
+				// The call comes back as its own creating update rather
+				// than as a chunk of this message: it is grouped under the
+				// id it was stored with, not under the message id the text
+				// around it rides on.
+				out = append(out, toolCallStart(part.ToolRequest, cwd))
+				continue
+			}
 			if update, ok := updateForPart(part, id); ok {
 				out = append(out, update)
 			}
+		}
+		return out
+	case ai.RoleTool:
+		// The results answering the calls above: status and output,
+		// rebuilt from the stored response through the builder the
+		// middleware reports live with, on the id the creating update was
+		// filed under, so a loaded session closes every call it made
+		// rather than leaving them pending.
+		var out []acp.SessionUpdate
+		for _, part := range m.Content {
+			if part == nil || part.ToolResponse == nil || part.ToolResponse.Ref == "" {
+				continue
+			}
+			out = append(out, toolCallOutcome(part.ToolResponse.Ref, acp.ToolCallStatusCompleted, part.ToolResponse.Output))
 		}
 		return out
 	}
@@ -178,8 +209,11 @@ func updatesForReplay(m *ai.Message) []acp.SessionUpdate {
 // updateForPart maps a Genkit part to the ACP update that carries it, stamped
 // with messageID so every chunk of the turn groups under one message. Text is
 // the agent's reply; reasoning is the model's thinking, which ACP streams as a
-// separate thought channel. Other kinds (tool calls, media, data) have no ACP
-// update wired up yet and are dropped.
+// separate thought channel. Tool requests are dropped rather than mapped:
+// the streaming path would report a call the reporter already reported from
+// the assembled response, with half its arguments, and the replay path turns
+// them into tool_call updates of its own before calling this. Other kinds
+// (media, data) have no ACP update wired up yet and are dropped.
 func updateForPart(part *ai.Part, messageID string) (acp.SessionUpdate, bool) {
 	if part == nil || part.Text == "" {
 		return acp.SessionUpdate{}, false
