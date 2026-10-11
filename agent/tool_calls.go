@@ -113,8 +113,20 @@ func (r toolCallReporter) wrapTool(ctx context.Context, params *ai.ToolParams, n
 // empty on either path — genkit fills in a missing one before a response
 // leaves the model (ensureToolRequestRefs).
 func toolCallStart(req *ai.ToolRequest, cwd string) acp.SessionUpdate {
-	view := toolCallViewFor(req.Name)
-	path := resolveToolPath(inputString(req.Input, view.pathKey), cwd)
+	kind, title := acp.ToolKindOther, req.Name
+	path := resolveToolPath(inputString(req.Input, "filePath"), cwd)
+	switch req.Name {
+	case "read":
+		kind, title = acp.ToolKindRead, "Reading "+pathLabel(path)
+	case "write":
+		kind, title = acp.ToolKindEdit, "Writing "+pathLabel(path)
+	case useSkillToolName:
+		// skillName names a directory under the skills library rather than
+		// a file: it titles the call, and no location rides along.
+		if skill := inputString(req.Input, "skillName"); skill != "" {
+			title = "Loading skill " + skill
+		}
+	}
 
 	var locations []acp.ToolCallLocation
 	if path != "" {
@@ -129,12 +141,21 @@ func toolCallStart(req *ai.ToolRequest, cwd string) acp.SessionUpdate {
 	// would write into the model's own input map on its way to the tool.
 	return acp.SessionUpdate{ToolCall: &acp.SessionUpdateToolCall{
 		ToolCallId: acp.ToolCallId(req.Ref),
-		Title:      view.title(req.Name, path),
-		Kind:       view.kind,
+		Title:      title,
+		Kind:       kind,
 		Status:     acp.ToolCallStatusPending,
 		RawInput:   req.Input,
 		Locations:  locations,
 	}}
+}
+
+// pathLabel is the tail of a file tool's title: the file it names, or the
+// bare noun when the call named none.
+func pathLabel(path string) string {
+	if path == "" {
+		return "file"
+	}
+	return path
 }
 
 // toolCallOutcome builds the tool_call_update carrying one call's result:
@@ -149,39 +170,6 @@ func toolCallOutcome(ref string, status acp.ToolCallStatus, output any) acp.Sess
 		Status:     &status,
 		RawOutput:  output,
 	}}
-}
-
-// toolCallView is how one of the agent's tools reads to the client: the
-// kind its icon follows, the verb its title opens with, and the input field
-// naming the file the call acts on, when there is one.
-type toolCallView struct {
-	kind    acp.ToolKind
-	verb    string
-	pathKey string
-}
-
-func toolCallViewFor(name string) toolCallView {
-	switch name {
-	case "read":
-		return toolCallView{kind: acp.ToolKindRead, verb: "Reading", pathKey: "filePath"}
-	case "write":
-		return toolCallView{kind: acp.ToolKindEdit, verb: "Writing", pathKey: "filePath"}
-	}
-	return toolCallView{kind: acp.ToolKindOther}
-}
-
-// title reads "Reading /abs/path" when the tool names a file, the bare
-// verb when it does not, and is the tool's own name for a tool this agent
-// knows nothing about.
-func (v toolCallView) title(name, path string) string {
-	switch {
-	case v.verb == "":
-		return name
-	case path != "":
-		return v.verb + " " + path
-	default:
-		return v.verb + " file"
-	}
 }
 
 // resolveToolPath turns the path the model named into the absolute one the

@@ -8,7 +8,6 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
-	"github.com/firebase/genkit/go/plugins/middleware"
 )
 
 // The four outcomes a session/request_permission exchange may select,
@@ -40,21 +39,6 @@ const maxAutoDeniedRounds = 3
 // into: the prompt turn it answers is over, with nothing run and nothing
 // stored, which is how Prompt reports it back.
 var errPermissionCancelled = errors.New("permission request cancelled")
-
-// turnMiddleware builds the middleware bundle for one Generate call: the
-// approval gate first, the tool-call reporter second. The chain applies
-// outer-to-inner, so the gate decides before the reporter's WrapTool ever
-// sees the call — a held tool stays pending on the client instead of
-// flicking through in_progress, and the reporter's Ref is already on the
-// request the permission prompt names. The bundle is rebuilt per call
-// rather than held for the turn: an allow_always answered mid-turn must be
-// in the gate before the next Generate runs.
-func (a *Agent) turnMiddleware(s *Session, sid acp.SessionId) []ai.Middleware {
-	return []ai.Middleware{
-		&middleware.ToolApproval{AllowedTools: s.allowedTools()},
-		toolCallReporter{agent: a, sid: sid, cwd: s.cwd},
-	}
-}
 
 // resumeFunc re-runs Generate over a conversation the approval gate paused:
 // the whole history as it stands, the restarts for the calls the user

@@ -67,6 +67,14 @@ func TestToolCallStartFilesCallUnderItsRef(t *testing.T) {
 			wantTitle: "search",
 			wantKind:  acp.ToolKindOther,
 		},
+		{
+			name: "use_skill titles the skill it loads, not a path",
+			req: &ai.ToolRequest{Ref: "call_5", Name: useSkillToolName, Input: map[string]any{
+				"skillName": "python-helper",
+			}},
+			wantTitle: "Loading skill python-helper",
+			wantKind:  acp.ToolKindOther,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -62,6 +62,12 @@ Every tool call is gated: the model's request is held until the client answers `
 
 A held call stays `pending` under the `toolCallId` its creating update was filed with, then runs to `completed` — or closes as `failed` with the refusal — under that same id once the answer arrives. A refusal is answered to the model as a tool response rather than left hanging, so the turn still finishes on a complete conversation, and a `cancelled` outcome ends the prompt turn with `stopReason: "cancelled"`, storing nothing. A client that never answers `session/request_permission` fails the turn rather than letting a tool run unasked.
 
+## Skills
+
+A `skills/` directory against the agent's process working directory holds one skill per direct subdirectory containing a `SKILL.md`. Only each skill's directory name and its frontmatter `description` are listed, in a `<skills>` block appended to the system prompt; the body loads on demand through the `use_skill` tool the model calls, so the heavy instructions stay off the hot path. Discovery is one level deep — nested directories and names starting with `.` are skipped — and a directory that cannot be read is skipped with a warning rather than failing the turn, so a missing `skills/` directory means no skills and no error.
+
+`use_skill` is pre-approved: loading a skill reads a local file, so the approval gate never asks about it. It is still reported to the client as a tool call like any other, titled after the skill it loads. The loaded body rides in the transcript, so it stays in the model's context for the rest of the session.
+
 ## Supported providers
 
 Dedicated plugins under `github.com/firebase/genkit/go/plugins/compat_oai/`:
