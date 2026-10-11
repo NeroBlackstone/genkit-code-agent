@@ -5,7 +5,6 @@ import (
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
 )
 
@@ -18,18 +17,6 @@ type Agent struct {
 
 	g      *genkit.Genkit
 	models []Model
-	// tools are the tools this agent offers the model, registered on g when
-	// one is wired and empty otherwise.
-	tools []ai.ToolRef
-
-	// capsMu guards caps: Initialize writes it on the connection's dispatch
-	// goroutine, a turn reads it on another, so the read side takes the lock
-	// instead of leaning on initialize happening first.
-	capsMu sync.RWMutex
-	// caps is what the client advertised in initialize. Only its filesystem
-	// half is consulted today, by writerFor and readerFor, which must know
-	// it before calling fs/write_text_file or fs/read_text_file.
-	caps acp.ClientCapabilities
 }
 
 var (
@@ -45,7 +32,6 @@ func New(g *genkit.Genkit, models []Model) *Agent {
 		sessions: make(map[string]*Session),
 		g:        g,
 		models:   models,
-		tools:    defineTools(g),
 	}
 }
 
@@ -57,13 +43,13 @@ func (a *Agent) SetAgentConnection(conn *acp.AgentSideConnection) {
 }
 
 func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
-	// The client's half of the capability negotiation, kept so the methods
-	// it gates can be checked: fs/write_text_file may only be called once
-	// the client has said it supports it.
-	a.capsMu.Lock()
-	a.caps = params.ClientCapabilities
-	a.capsMu.Unlock()
-
+	// The client's capabilities ride in on params and are deliberately not
+	// stored: the filesystem half of them gated fs/read_text_file and
+	// fs/write_text_file, methods ACP v2 removes. File and command access
+	// now belong to the agent — file tools through genkit's Filesystem
+	// middleware, rooted at the session cwd, and an MCP server when a
+	// client wants to offer more — so nothing here needs to remember what
+	// the client said it supports.
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
@@ -86,22 +72,6 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (a
 			},
 		},
 	}, nil
-}
-
-// fsWriteCapable reports whether the client advertised fs.writeTextFile.
-// writerFor consults it before every turn decides where its writes go.
-func (a *Agent) fsWriteCapable() bool {
-	a.capsMu.RLock()
-	defer a.capsMu.RUnlock()
-	return a.caps.Fs.WriteTextFile
-}
-
-// fsReadCapable reports whether the client advertised fs.readTextFile.
-// readerFor consults it before every turn decides where its reads go.
-func (a *Agent) fsReadCapable() bool {
-	a.capsMu.RLock()
-	defer a.capsMu.RUnlock()
-	return a.caps.Fs.ReadTextFile
 }
 
 func (a *Agent) Authenticate(ctx context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {

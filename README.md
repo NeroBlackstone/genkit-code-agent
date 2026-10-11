@@ -56,6 +56,12 @@ A conversation lives in the store, not in the process: `~/.gca/workspaces/<cwd h
 
 Both `session/resume` (continue without a replay) and `session/load` (stream the stored conversation back as notifications) are served from that file. A workspace that cannot be opened leaves sessions running turn by turn with no history, and a stored file that cannot be read is quarantined aside as `.bak` rather than overwritten.
 
+## File tools
+
+File access comes from Genkit's `Filesystem` middleware, not from the client's `fs/read_text_file` / `fs/write_text_file` methods — ACP v2 removes those, and this agent never calls them whatever capabilities the client advertises. Each turn builds the middleware once, rooted at the session's working directory: `list_files` and `read_file` are always registered, `write_file` and `edit_file` join them since write access is enabled, and `os.Root` keeps every path inside the root — `..`, absolute paths, and symlinks that climb out are refused.
+
+`read_file` answers with a short summary and delivers the file itself as a user message on the next model turn; `edit_file`, and `write_file` over an existing file, refuse work on a file that was not read first, and refuse it again when the file changed on disk since that read. The middleware instance lives for the whole turn, which is what lets that read-before-write hold across the approval gate: an approved `edit_file` runs in a later Generate of the same turn and has to find the state the approved `read_file` recorded in an earlier one. A client that wants to expose more than one directory, unsaved editor state, or command execution should put an MCP server on the session (`mcpServers` on `session/new` / `session/resume`), where those tools sit on the same footing as the rest.
+
 ## Tool approval
 
 Every tool call is gated: the model's request is held until the client answers `session/request_permission`, which the agent asks with the four outcomes the protocol defines — allow once, always allow, reject once, always reject. The two `once` choices resolve only the call they answer; the two `always` choices are remembered on the session, in memory only — nothing is written to the store or to `gca.json`, so a new session or a restarted agent asks again.

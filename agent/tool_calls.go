@@ -116,10 +116,17 @@ func toolCallStart(req *ai.ToolRequest, cwd string) acp.SessionUpdate {
 	kind, title := acp.ToolKindOther, req.Name
 	path := resolveToolPath(inputString(req.Input, "filePath"), cwd)
 	switch req.Name {
-	case "read":
+	case "read_file":
 		kind, title = acp.ToolKindRead, "Reading "+pathLabel(path)
-	case "write":
+	case "write_file":
 		kind, title = acp.ToolKindEdit, "Writing "+pathLabel(path)
+	case "edit_file":
+		kind, title = acp.ToolKindEdit, "Editing "+pathLabel(path)
+	case "list_files":
+		// list_files names a directory rather than a file: it titles the
+		// call after the directory and files below it get no location.
+		path = resolveToolPath(inputString(req.Input, "dirPath"), cwd)
+		kind, title = acp.ToolKindOther, "Listing "+pathLabel(path)
 	case useSkillToolName:
 		// skillName names a directory under the skills library rather than
 		// a file: it titles the call, and no location rides along.
@@ -131,7 +138,8 @@ func toolCallStart(req *ai.ToolRequest, cwd string) acp.SessionUpdate {
 	var locations []acp.ToolCallLocation
 	if path != "" {
 		location := acp.ToolCallLocation{Path: path}
-		if line, ok := inputInt(req.Input, "line"); ok {
+		// read_file windows by offset, the 1-indexed line it starts at.
+		if line, ok := inputInt(req.Input, "offset"); ok {
 			location.Line = line
 		}
 		locations = append(locations, location)
@@ -174,7 +182,8 @@ func toolCallOutcome(ref string, status acp.ToolCallStatus, output any) acp.Sess
 
 // resolveToolPath turns the path the model named into the absolute one the
 // client's follow-along expects: a relative one lands under the session cwd,
-// the same rule the read and write tools resolve by.
+// which is also the root the filesystem middleware confines its tools to, so
+// the two agree on where the file is.
 func resolveToolPath(path, cwd string) string {
 	if path == "" || filepath.IsAbs(path) {
 		return path

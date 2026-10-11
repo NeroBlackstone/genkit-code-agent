@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,11 +21,13 @@ import (
 
 // startRoleToolModel serves the fake model the remembered-choice tests
 // drive: a request whose last message is from the user asks for a tool call
-// on toolName carrying toolCallArg, anything later answers finalText. Each
-// prompt's first request ends with the user's message, so every prompt asks
-// again — which is what a second prompt needs to show that an always choice
-// answered on the first never reaches the client on the next.
-func startRoleToolModel(t *testing.T, toolName, toolCallArg, finalText string) func() []string {
+// on toolName carrying whatever args returns now, anything later answers
+// finalText. Each prompt's first request ends with the user's message, so
+// every prompt asks again — which is what a second prompt needs to show that
+// an always choice answered on the first never reaches the client on the
+// next. args is consulted once per prompt, which is how a test gives each
+// write its own file.
+func startRoleToolModel(t *testing.T, toolName string, args func() string, finalText string) func() []string {
 	t.Helper()
 
 	var (
@@ -47,7 +50,7 @@ func startRoleToolModel(t *testing.T, toolName, toolCallArg, finalText string) f
 		flusher, _ := w.(http.Flusher)
 		chunks := finalAnswerChunks(finalText)
 		if lastMessageIsUser(body) {
-			chunks = firstToolCallChunks(toolName, toolCallArg)
+			chunks = firstToolCallChunks(toolName, args())
 		}
 		for _, c := range chunks {
 			fmt.Fprintf(w, "data: %s\n\n", c)
@@ -85,20 +88,19 @@ func lastMessageIsUser(body []byte) bool {
 // the real ACP pipes: the gate holds the write, the client answers
 // allow-once over session/request_permission, and the restart runs the tool
 // under the same id — pending at the creating update, in_progress as it
-// runs, completed with what it wrote, and the turn finishes with the tool's
-// result in the model's next request.
+// runs, completed with what it wrote — with the file landing on the agent's
+// own disk under the session cwd. The turn finishes with the tool's result
+// in the model's next request.
 func TestToolApprovalAsksBeforeRunning(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
 	wantPath := filepath.Join(cwd, "out.txt")
 
-	requests := startToolModel(t, "write",
-		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, wantPath), "the file is written")
+	requests := startToolModel(t, "write_file",
+		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, "out.txt"), "the file is written")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{WriteTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -156,10 +158,18 @@ func TestToolApprovalAsksBeforeRunning(t *testing.T) {
 		t.Errorf("third status = %q, want completed", s)
 	}
 
-	// Approved means run: the write went over fs/write_text_file.
-	writes := rc.fsWrites()
-	if len(writes) != 1 || writes[0].Path != wantPath || writes[0].Content != "hello" {
-		t.Fatalf("fs/write_text_file requests = %+v, want one for %q", writes, wantPath)
+	// Approved means run: the write reached the agent's own disk under the
+	// session cwd, and the client's removed fs surface was not used to get
+	// it there.
+	data, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("file content = %q, want what the model asked for", data)
+	}
+	if writes := rc.fsWrites(); len(writes) != 0 {
+		t.Errorf("fs/write_text_file requests = %+v, want none", writes)
 	}
 
 	// And the model saw what it did: two requests, the second carrying the
@@ -168,7 +178,7 @@ func TestToolApprovalAsksBeforeRunning(t *testing.T) {
 	if len(bodies) != 2 {
 		t.Fatalf("model requests = %d, want 2 (tool call round)", len(bodies))
 	}
-	if !strings.Contains(bodies[1], "Wrote 5 bytes") {
+	if !strings.Contains(bodies[1], "written successfully") {
 		t.Errorf("second request missing the tool result:\n%s", bodies[1])
 	}
 }
@@ -182,13 +192,11 @@ func TestToolApprovalRejectOnceSkipsTool(t *testing.T) {
 	cwd := t.TempDir()
 	wantPath := filepath.Join(cwd, "out.txt")
 
-	requests := startToolModel(t, "write",
-		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, wantPath), "the file is refused")
+	requests := startToolModel(t, "write_file",
+		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, "out.txt"), "the file is refused")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{WriteTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 	rc.permission = func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 		return selectPermission(permissionRejectOnce), nil
 	}
@@ -231,6 +239,11 @@ func TestToolApprovalRejectOnceSkipsTool(t *testing.T) {
 		t.Errorf("rawOutput = %#v, want the denial the model read", failed.RawOutput)
 	}
 
+	// Nothing wrote the file: the refusal ran no tool, and the agent's own
+	// disk was never touched in its place.
+	if _, err := os.Stat(wantPath); !os.IsNotExist(err) {
+		t.Errorf("stat %s = %v, want the file never written", wantPath, err)
+	}
 	if writes := rc.fsWrites(); len(writes) != 0 {
 		t.Errorf("fs/write_text_file requests = %+v, want none from a refused call", writes)
 	}
@@ -242,7 +255,9 @@ func TestToolApprovalRejectOnceSkipsTool(t *testing.T) {
 	if !strings.Contains(bodies[1], denialReply) {
 		t.Errorf("second request missing the denial:\n%s", bodies[1])
 	}
-	if !strings.Contains(bodies[1], wantPath) {
+	// The refusal still names the file: the model's own arguments, carried
+	// in the request that asked for the call.
+	if !strings.Contains(bodies[1], "out.txt") {
 		t.Errorf("second request's refusal missing the path:\n%s", bodies[1])
 	}
 }
@@ -250,19 +265,22 @@ func TestToolApprovalRejectOnceSkipsTool(t *testing.T) {
 // TestToolApprovalAllowAlwaysSticksToSession drives two prompts on one
 // session with an always-allow on the first: the second prompt's write runs
 // without the client ever being asked again, for the gate carries the
-// session's remembered choice into every call of every turn. Nothing is
-// written anywhere: the memory dies with the session.
+// session's remembered choice into every call of every turn. Each prompt
+// writes its own file — a write_file over an existing one it never read
+// would be refused by the middleware, approval or not — and the memory of
+// the choice dies with the session, not on disk.
 func TestToolApprovalAllowAlwaysSticksToSession(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
 
-	requests := startRoleToolModel(t, "write",
-		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, filepath.Join(cwd, "out.txt")), "done")
+	prompts := 0
+	requests := startRoleToolModel(t, "write_file", func() string {
+		prompts++
+		return fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, fmt.Sprintf("out_%d.txt", prompts))
+	}, "done")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{WriteTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 	rc.permission = func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 		return selectPermission(permissionAllowAlways), nil
 	}
@@ -288,8 +306,8 @@ func TestToolApprovalAllowAlwaysSticksToSession(t *testing.T) {
 	if perms := rc.permissionRequests(); len(perms) != 1 {
 		t.Fatalf("permission requests after first prompt = %d, want one", len(perms))
 	}
-	if writes := rc.fsWrites(); len(writes) != 1 {
-		t.Fatalf("fs writes after first prompt = %d, want one", len(writes))
+	if data, err := os.ReadFile(filepath.Join(cwd, "out_1.txt")); err != nil || string(data) != "hello" {
+		t.Errorf("first write = %q, %v, want it on disk", data, err)
 	}
 	if bodies := requests(); len(bodies) != 2 {
 		t.Fatalf("model requests after first prompt = %d, want the tool round closed", len(bodies))
@@ -299,11 +317,14 @@ func TestToolApprovalAllowAlwaysSticksToSession(t *testing.T) {
 	if perms := rc.permissionRequests(); len(perms) != 1 {
 		t.Fatalf("permission requests after second prompt = %d, want the always-allow to spare it", len(perms))
 	}
-	if writes := rc.fsWrites(); len(writes) != 2 {
-		t.Fatalf("fs writes after second prompt = %d, want the second write to have run", len(writes))
+	if data, err := os.ReadFile(filepath.Join(cwd, "out_2.txt")); err != nil || string(data) != "hello" {
+		t.Errorf("second write = %q, %v, want it on disk", data, err)
 	}
 	if bodies := requests(); len(bodies) != 4 {
 		t.Fatalf("model requests after second prompt = %d, want 4", len(bodies))
+	}
+	if writes := rc.fsWrites(); len(writes) != 0 {
+		t.Errorf("fs/write_text_file requests = %+v, want none", writes)
 	}
 
 	_ = agentConn.Done()
@@ -317,14 +338,14 @@ func TestToolApprovalAllowAlwaysSticksToSession(t *testing.T) {
 func TestToolApprovalRejectAlwaysSkipsPrompt(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	wantPath := filepath.Join(cwd, "out.txt")
 
-	requests := startRoleToolModel(t, "write",
-		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, filepath.Join(cwd, "out.txt")), "done")
+	requests := startRoleToolModel(t, "write_file", func() string {
+		return fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, "out.txt")
+	}, "done")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{WriteTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 	rc.permission = func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 		return selectPermission(permissionRejectAlways), nil
 	}
@@ -366,6 +387,9 @@ func TestToolApprovalRejectAlwaysSkipsPrompt(t *testing.T) {
 	if !strings.Contains(bodies[3], denialReply) {
 		t.Errorf("fourth request missing the denial:\n%s", bodies[3])
 	}
+	if _, err := os.Stat(wantPath); !os.IsNotExist(err) {
+		t.Errorf("stat %s = %v, want the file never written", wantPath, err)
+	}
 	if writes := rc.fsWrites(); len(writes) != 0 {
 		t.Errorf("fs/write_text_file requests = %+v, want none ever", writes)
 	}
@@ -383,6 +407,7 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
 	writePath := filepath.Join(cwd, "out.txt")
+	seedFile(t, filepath.Join(cwd, "src", "main.go"), "package main\n")
 
 	var (
 		mu     sync.Mutex
@@ -405,10 +430,10 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 		flusher, _ := w.(http.Flusher)
 		chunks := finalAnswerChunks("both done")
 		if n == 1 {
-			writeArgs := fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, writePath)
+			writeArgs := fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, "out.txt")
 			readArgs := fmt.Sprintf(`{"filePath":%q}`, filepath.Join("src", "main.go"))
 			chunks = []string{
-				fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write","arguments":%q}},{"index":1,"id":"call_2","type":"function","function":{"name":"read","arguments":%q}}]},"finish_reason":null}]}`, writeArgs, readArgs),
+				fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_file","arguments":%q}},{"index":1,"id":"call_2","type":"function","function":{"name":"read_file","arguments":%q}}]},"finish_reason":null}]}`, writeArgs, readArgs),
 				`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 				`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
 			}
@@ -425,9 +450,7 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 	t.Setenv("DEEPSEEK_BASE_URL", srv.URL)
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{ReadTextFile: true, WriteTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -475,20 +498,30 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 		t.Errorf("both permissions name %q, want one per tool", perms[0].ToolCall.ToolCallId)
 	}
 
-	// One resume ran both: the write reached the client, the read's answer
-	// came back from it, and the model's second request carries both.
-	if writes := rc.fsWrites(); len(writes) != 1 || writes[0].Path != writePath {
-		t.Errorf("fs/write_text_file requests = %+v, want one for %q", writes, writePath)
+	// One resume ran both: the write reached the agent's own disk, the
+	// read answered from it, and the model's second request carries both —
+	// the contents through the user message read_file injects, the write's
+	// result through the tool response. Nothing went over the client's
+	// removed fs surface.
+	data, err := os.ReadFile(writePath)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
 	}
-	if reads := rc.fsReads(); len(reads) != 1 {
-		t.Errorf("fs/read_text_file requests = %+v, want one", reads)
+	if string(data) != "hello" {
+		t.Errorf("file content = %q, want what the model asked for", data)
+	}
+	if writes := rc.fsWrites(); len(writes) != 0 {
+		t.Errorf("fs/write_text_file requests = %+v, want none", writes)
+	}
+	if reads := rc.fsReads(); len(reads) != 0 {
+		t.Errorf("fs/read_text_file requests = %+v, want none", reads)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(bodies) != 2 {
 		t.Fatalf("model requests = %d, want 2", len(bodies))
 	}
-	if !strings.Contains(bodies[1], "Wrote 5 bytes") || !strings.Contains(bodies[1], "file body from client") {
+	if !strings.Contains(bodies[1], "written successfully") || !strings.Contains(bodies[1], "package main") {
 		t.Errorf("second request missing one of the two results:\n%s", bodies[1])
 	}
 }
@@ -500,14 +533,13 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 func TestToolApprovalCancelledPermissionEndsTurn(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	wantPath := filepath.Join(cwd, "out.txt")
 
-	requests := startToolModel(t, "write",
-		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, filepath.Join(cwd, "out.txt")), "never reached")
+	requests := startToolModel(t, "write_file",
+		fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, "out.txt"), "never reached")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	ag, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{WriteTextFile: true},
-	})
+	ag, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 	rc.permission = func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 		return acp.RequestPermissionResponse{
 			Outcome: acp.RequestPermissionOutcome{
@@ -538,6 +570,9 @@ func TestToolApprovalCancelledPermissionEndsTurn(t *testing.T) {
 
 	if writes := rc.fsWrites(); len(writes) != 0 {
 		t.Errorf("fs/write_text_file requests = %+v, want none from a cancelled turn", writes)
+	}
+	if _, err := os.Stat(wantPath); !os.IsNotExist(err) {
+		t.Errorf("stat %s = %v, want the file never written", wantPath, err)
 	}
 	if bodies := requests(); len(bodies) != 1 {
 		t.Errorf("model requests = %d, want 1 — the resume never ran", len(bodies))

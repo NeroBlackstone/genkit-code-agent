@@ -241,7 +241,8 @@ func TestLoadSessionReplaysToolCall(t *testing.T) {
 	cwd := t.TempDir()
 	relative := filepath.Join("src", "main.go")
 	wantPath := filepath.Join(cwd, relative)
-	requests := startToolModel(t, "read", fmt.Sprintf(`{"filePath":%q}`, relative), "the file is read")
+	seedFile(t, wantPath, "package main\n")
+	requests := startToolModel(t, "read_file", fmt.Sprintf(`{"filePath":%q}`, relative), "the file is read")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
 
@@ -287,8 +288,8 @@ func TestLoadSessionReplaysToolCall(t *testing.T) {
 	if liveOutcome == nil || liveOutcome.ToolCallId != live[0].ToolCallId {
 		t.Fatalf("live outcome = %+v, want it filed under %q", liveEvents[2], live[0].ToolCallId)
 	}
-	if s, _ := liveOutcome.RawOutput.(string); !strings.Contains(s, "the client does not support fs/read_text_file") {
-		t.Errorf("live rawOutput = %#v, want the output the model read back", liveOutcome.RawOutput)
+	if s, _ := liveOutcome.RawOutput.(string); !strings.Contains(s, "read successfully") {
+		t.Errorf("live rawOutput = %#v, want read_file's summary", liveOutcome.RawOutput)
 	}
 
 	// A fresh agent knows nothing but the cwd and the session id.
@@ -378,12 +379,17 @@ func TestLoadSessionReplaysToolCall(t *testing.T) {
 		t.Errorf("replayed rawOutput = %#v, want the live turn's %#v", outcome.RawOutput, liveOutcome.RawOutput)
 	}
 
-	// The text around the call replays with it.
+	// The text around the call replays with it: the prompt first, then the
+	// user message read_file injected the file's contents through, which
+	// is part of the stored conversation the model read and belongs to the
+	// replay like any other message.
 	rc2.testClient.mu.Lock()
 	events := append([]streamEvent(nil), rc2.events...)
 	rc2.testClient.mu.Unlock()
-	if want, got := "show me main.go", joined(events, "user"); want != got {
-		t.Errorf("replayed prompt = %q, want %q", got, want)
+	if got := joined(events, "user"); !strings.HasPrefix(got, "show me main.go") {
+		t.Errorf("replayed prompt = %q, want it leading the user channel", got)
+	} else if !strings.Contains(got, "<read_file path=") {
+		t.Errorf("replayed user channel = %q, want the injected file contents with the prompt", got)
 	}
 	if want, got := "the file is read", joined(events, "message"); want != got {
 		t.Errorf("replayed answer = %q, want %q", got, want)

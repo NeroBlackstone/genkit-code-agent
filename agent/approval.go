@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/firebase/genkit/go/ai"
-	"github.com/firebase/genkit/go/genkit"
 )
 
 // The four outcomes a session/request_permission exchange may select,
@@ -70,31 +70,14 @@ func (a *Agent) resolveInterrupts(ctx context.Context, resp *ai.ModelResponse, s
 			}
 			prompted = prompted || asked
 
-			tool := genkit.LookupTool(a.g, req.Name)
 			if allow {
-				if tool == nil {
-					return nil, fmt.Errorf("approve unknown tool %q", req.Name)
-				}
-				// The approval flag rides the restart metadata: it is the
-				// only thing the gate reads as approval, so a bare resume
-				// of the same conversation cannot slip past it.
-				restarts = append(restarts, tool.Restart(interrupt, &ai.RestartOptions{
-					ResumedMetadata: map[string]any{"toolApproved": true},
-				}))
+				restarts = append(restarts, restartPart(interrupt))
 				continue
 			}
 			// Refused: the model hears why instead of waiting on a
 			// response that never comes, and the client's call is closed
 			// rather than left pending forever.
-			if tool != nil {
-				responds = append(responds, tool.Respond(interrupt, denialReply, nil))
-			} else {
-				responds = append(responds, ai.NewToolResponsePart(&ai.ToolResponse{
-					Name:   req.Name,
-					Ref:    req.Ref,
-					Output: denialReply,
-				}))
-			}
+			responds = append(responds, respondPart(interrupt, denialReply))
 			if err := a.sendUpdate(ctx, sid, toolCallOutcome(req.Ref, acp.ToolCallStatusFailed, denialReply)); err != nil {
 				return nil, err
 			}
@@ -115,6 +98,41 @@ func (a *Agent) resolveInterrupts(ctx context.Context, resp *ai.ModelResponse, s
 		resp = next
 	}
 	return resp, nil
+}
+
+// restartPart rebuilds an interrupted tool request as the restart the
+// approval gate reads as a run: the same call under the same ref, carrying
+// the toolApproved flag on its resumed metadata — the only thing the gate
+// accepts as approval, so a bare resume of the same conversation cannot slip
+// past it. The shape matches what a tool's own Restart produces; it is built
+// here rather than through the registry because every tool this gate holds is
+// contributed by middleware, whose tools are registered on the child registry
+// of the Generate that ran them and are not reachable from the root one.
+func restartPart(p *ai.Part) *ai.Part {
+	meta := maps.Clone(p.Metadata)
+	if meta == nil {
+		meta = make(map[string]any)
+	}
+	meta["resumed"] = map[string]any{"toolApproved": true}
+	delete(meta, "interrupt")
+	restarted := ai.NewToolRequestPart(&ai.ToolRequest{
+		Name:  p.ToolRequest.Name,
+		Ref:   p.ToolRequest.Ref,
+		Input: p.ToolRequest.Input,
+	})
+	restarted.Metadata = meta
+	return restarted
+}
+
+// respondPart answers an interrupted tool request with output the model reads
+// back, marked interruptResponse so a later replay of the transcript shows
+// the call as the failed the live turn reported rather than as a run that
+// completed. Same shape a tool's own Respond produces, for the same registry
+// reason as restartPart.
+func respondPart(p *ai.Part, output any) *ai.Part {
+	answered := ai.NewResponseForToolRequest(p, output)
+	answered.Metadata = map[string]any{"interruptResponse": true}
+	return answered
 }
 
 // decidePermission resolves one interrupted tool request: a rejection the

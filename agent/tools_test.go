@@ -2,10 +2,8 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,25 +14,114 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/firebase/genkit/go/ai"
-	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/firebase/genkit/go/plugins/compat_oai/deepseek"
 )
 
-// TestWriteToolRunsInTurn drives a whole tool round through the real ACP
-// pipes: the fake model asks for a write on the first request, genkit runs
-// the tool, and the second request carries the tool result that lets the
-// model answer. The client advertised no fs capability, so the tool must
-// refuse with a message the model can read: the protocol forbids calling
-// fs/write_text_file, and nothing writes the file in its place. The stored
-// transcript is what the round must leave behind either way.
-func TestWriteToolRunsInTurn(t *testing.T) {
+// firstToolCallChunks streams a single tool call asking for the named tool.
+func firstToolCallChunks(toolName, args string) []string {
+	return []string{
+		fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":%q,"arguments":%q}}]},"finish_reason":null}]}`, toolName, args),
+		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+	}
+}
+
+func finalAnswerChunks(text string) []string {
+	return []string{
+		fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","content":%q},"finish_reason":null}]}`, text),
+		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25}}`,
+	}
+}
+
+// startToolModelCalls serves the fake model the tool tests drive: call is
+// asked for the request at hand (1-based, counting chat completions) and
+// answers with a tool call on the name and arguments it returns, or with
+// finalText when it returns no name. It returns the request bodies it
+// recorded, in arrival order, and points DEEPSEEK_BASE_URL at itself for the
+// duration of the test.
+func startToolModelCalls(t *testing.T, call func(n int) (tool, args string), finalText string) func() []string {
+	t.Helper()
+
+	var (
+		mu     sync.Mutex
+		bodies []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		n := len(bodies)
+		mu.Unlock()
+
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"object":"list","data":[]}`)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		chunks := finalAnswerChunks(finalText)
+		if tool, args := call(n); tool != "" {
+			chunks = firstToolCallChunks(tool, args)
+		}
+		for _, c := range chunks {
+			fmt.Fprintf(w, "data: %s\n\n", c)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("DEEPSEEK_BASE_URL", srv.URL)
+
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), bodies...)
+	}
+}
+
+// startToolModel serves the one-call variant: the first request answers with
+// a tool call on toolName carrying toolCallArg, every later one with
+// finalText.
+func startToolModel(t *testing.T, toolName, toolCallArg, finalText string) func() []string {
+	t.Helper()
+	return startToolModelCalls(t, func(n int) (string, string) {
+		if n == 1 {
+			return toolName, toolCallArg
+		}
+		return "", ""
+	}, finalText)
+}
+
+// seedFile plants one file under the session cwd for a read to find.
+func seedFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// TestWriteFileToolWritesOnDisk drives a whole tool round through the real
+// ACP pipes: the model asks write_file, the approval gate holds it, the
+// default allow-once answer runs it, and the file lands on the agent's own
+// disk under the session cwd — the client holds no file surface any more, so
+// nothing goes over fs/write_text_file. The stored transcript is what the
+// round must leave behind either way.
+func TestWriteFileToolWritesOnDisk(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	wantPath := filepath.Join(cwd, "sub", "out.txt")
 
-	toolCallArg := fmt.Sprintf(`{"filePath":%q,"content":"hello from tool"}`, filepath.Join(cwd, "sub", "out.txt"))
-	requests := startToolModel(t, "write", toolCallArg, "the file is written")
+	toolCallArg := fmt.Sprintf(`{"filePath":%q,"content":"hello from tool"}`, filepath.Join("sub", "out.txt"))
+	requests := startToolModel(t, "write_file", toolCallArg, "the file is written")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
 
@@ -56,13 +143,22 @@ func TestWriteToolRunsInTurn(t *testing.T) {
 	_ = agentConn.Done()
 	_ = clientConn.Done()
 
-	// The tool had nowhere to write: no fs/write_text_file was called, and
-	// nothing landed on the agent's own disk in its place.
-	if writes := rc.fsWrites(); len(writes) != 0 {
-		t.Errorf("fs/write_text_file requests = %+v, want none without the capability", writes)
+	// The write went to the agent's own disk, through the middleware's
+	// os.Root, with the model's relative path landing under the cwd.
+	data, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(cwd, "sub", "out.txt")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("stat requested file = %v, want it never written locally", err)
+	if string(data) != "hello from tool" {
+		t.Errorf("file content = %q, want what the model asked for", data)
+	}
+	// The client's fs surface was not used, capability advertised or not:
+	// ACP v2 removes those methods, and this agent no longer calls them.
+	if writes := rc.fsWrites(); len(writes) != 0 {
+		t.Errorf("fs/write_text_file requests = %+v, want none", writes)
+	}
+	if reads := rc.fsReads(); len(reads) != 0 {
+		t.Errorf("fs/read_text_file requests = %+v, want none", reads)
 	}
 
 	reqBodies := requests()
@@ -70,12 +166,9 @@ func TestWriteToolRunsInTurn(t *testing.T) {
 		t.Fatalf("model requests = %d, want 2 (tool call round)", len(reqBodies))
 	}
 	// The second request must carry the tool response so the model can see
-	// what its call did: the refusal, naming the file it could not write.
-	if !strings.Contains(reqBodies[1], "the client does not support fs/write_text_file") {
-		t.Errorf("second request missing the refusal:\n%s", reqBodies[1])
-	}
-	if !strings.Contains(reqBodies[1], filepath.Join(cwd, "sub", "out.txt")) {
-		t.Errorf("second request's tool result missing the path:\n%s", reqBodies[1])
+	// what its call did.
+	if !strings.Contains(reqBodies[1], "File "+filepath.Join("sub", "out.txt")+" written successfully.") {
+		t.Errorf("second request missing the tool result:\n%s", reqBodies[1])
 	}
 
 	// The transcript keeps the whole round: prompt, tool-request message,
@@ -117,328 +210,24 @@ func TestWriteToolRunsInTurn(t *testing.T) {
 	}
 }
 
-// TestWriteToolGoesOverACP drives the same tool round against a client that
-// advertised fs.writeTextFile: the write must reach the client as one
-// fs/write_text_file request, carrying the session id and an absolute path,
-// and the agent's own disk must stay untouched, since the file now belongs
-// to the client and writing it twice is the bug this path exists to avoid.
-func TestWriteToolGoesOverACP(t *testing.T) {
+// TestReadFileToolReadsFromDisk drives a read round: the model's relative
+// path resolves under the session cwd, the contents it sees are the ones on
+// the agent's disk — read_file answers with a summary and injects the file
+// itself as a user message on the next turn — and the client is asked for
+// nothing over fs/read_text_file. The injected contents must not reach the
+// client as the agent's own reply either: they are the model's input, not
+// the answer being streamed.
+func TestReadFileToolReadsFromDisk(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
-	wantPath := filepath.Join(cwd, "sub", "out.txt")
-
-	toolCallArg := fmt.Sprintf(`{"filePath":%q,"content":"hello from tool"}`, wantPath)
-	requests := startToolModel(t, "write", toolCallArg, "the file is written")
-
-	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{ReadTextFile: true, WriteTextFile: true},
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
-	if err != nil {
-		t.Fatalf("new session: %v", err)
-	}
-	if _, err := clientConn.Prompt(ctx, acp.PromptRequest{
-		SessionId: sess.SessionId,
-		Prompt:    []acp.ContentBlock{acp.TextBlock("write hello to out.txt")},
-	}); err != nil {
-		t.Fatalf("prompt: %v", err)
-	}
-	_ = agentConn.Done()
-	_ = clientConn.Done()
-
-	writes := rc.fsWrites()
-	if len(writes) != 1 {
-		t.Fatalf("fs/write_text_file requests = %+v, want exactly one", writes)
-	}
-	w := writes[0]
-	if w.SessionId != sess.SessionId {
-		t.Errorf("sessionId = %q, want the session the turn ran on %q", w.SessionId, sess.SessionId)
-	}
-	if w.Path != wantPath {
-		t.Errorf("path = %q, want the absolute %q", w.Path, wantPath)
-	}
-	if w.Content != "hello from tool" {
-		t.Errorf("content = %q, want what the model asked for", w.Content)
-	}
-	// The agent wrote nothing itself: the client owns the file now.
-	if _, err := os.Stat(wantPath); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("stat %s = %v, want the file left to the client", wantPath, err)
-	}
-
-	reqBodies := requests()
-	if len(reqBodies) != 2 {
-		t.Fatalf("model requests = %d, want 2 (tool call round)", len(reqBodies))
-	}
-	if !strings.Contains(reqBodies[1], "Wrote 15 bytes to") {
-		t.Errorf("second request missing the tool result:\n%s", reqBodies[1])
-	}
-}
-
-// firstToolCallChunks streams a single tool call asking for the named tool.
-func firstToolCallChunks(toolName, args string) []string {
-	return []string{
-		fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":%q,"arguments":%q}}]},"finish_reason":null}]}`, toolName, args),
-		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
-	}
-}
-
-func finalAnswerChunks(text string) []string {
-	return []string{
-		fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","content":%q},"finish_reason":null}]}`, text),
-		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
-		`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25}}`,
-	}
-}
-
-// startToolModel serves the fake model the tool tests drive: the first
-// request answers with a tool call on toolName carrying toolCallArg, every
-// later one with finalText. It returns the request bodies it recorded, in
-// arrival order, and points DEEPSEEK_BASE_URL at itself for the duration of
-// the test.
-func startToolModel(t *testing.T, toolName, toolCallArg, finalText string) func() []string {
-	t.Helper()
-
-	var (
-		mu     sync.Mutex
-		bodies []string
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		mu.Lock()
-		bodies = append(bodies, string(body))
-		n := len(bodies)
-		mu.Unlock()
-
-		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"object":"list","data":[]}`)
-			return
-		}
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher, _ := w.(http.Flusher)
-		chunks := firstToolCallChunks(toolName, toolCallArg)
-		if n > 1 {
-			chunks = finalAnswerChunks(finalText)
-		}
-		for _, c := range chunks {
-			fmt.Fprintf(w, "data: %s\n\n", c)
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	t.Cleanup(srv.Close)
-	t.Setenv("DEEPSEEK_BASE_URL", srv.URL)
-
-	return func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]string(nil), bodies...)
-	}
-}
-
-// mustTool returns the named tool among refs, failing the test when the
-// registration did not produce one.
-func mustTool(t *testing.T, refs []ai.ToolRef, name string) ai.Tool {
-	t.Helper()
-	for _, ref := range refs {
-		if ref.Name() == name {
-			return ref.(ai.Tool)
-		}
-	}
-	t.Fatalf("registered tools = %v, want %q among them", refs, name)
-	return nil
-}
-
-// TestRunWriteResolvesRelativePath checks the tool's own path rules: a
-// relative filePath lands under the session cwd carried in the context, an
-// absolute one is used as-is, and both reach the turn's writer as absolute
-// paths, the only kind fs/write_text_file takes. With no writer at all the
-// tool refuses, since writing the file somewhere the client cannot see is
-// the bug the protocol exists to prevent.
-func TestRunWriteResolvesRelativePath(t *testing.T) {
-	dir := t.TempDir()
-	tw := mustTool(t, defineTools(genkit.Init(context.Background())), "write")
-
-	type writeRecord struct{ path, content string }
-	var writes []writeRecord
-	ctx := withToolEnv(context.Background(), toolEnv{
-		cwd: dir,
-		write: func(_ context.Context, path, content string) error {
-			writes = append(writes, writeRecord{path, content})
-			return nil
-		},
-	})
-
-	out, err := tw.RunRaw(ctx, WriteInput{FilePath: "a/b.txt", Content: "x"})
-	if err != nil {
-		t.Fatalf("run write: %v", err)
-	}
-	if s, _ := out.(string); !strings.Contains(s, "Wrote 1 bytes to") {
-		t.Errorf("output = %v, want a byte count", out)
-	}
-
-	abs := filepath.Join(dir, "c.txt")
-	if _, err := tw.RunRaw(ctx, WriteInput{FilePath: abs, Content: "y"}); err != nil {
-		t.Fatalf("run write absolute: %v", err)
-	}
-
-	want := []writeRecord{
-		{filepath.Join(dir, "a", "b.txt"), "x"},
-		{abs, "y"},
-	}
-	if len(writes) != len(want) {
-		t.Fatalf("writes = %+v, want %+v", writes, want)
-	}
-	for i := range want {
-		if writes[i] != want[i] {
-			t.Errorf("write %d = %+v, want %+v", i, writes[i], want[i])
-		}
-	}
-	// The writer is the only one that receives the file: the agent's own
-	// disk stays untouched.
-	for _, p := range []string{want[0].path, abs} {
-		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
-			t.Errorf("stat %s = %v, want the file written only through the client", p, err)
-		}
-	}
-
-	// No turn, no writer: the tool reports that to the model instead of
-	// falling back to a write the client would never learn about.
-	out, err = tw.RunRaw(context.Background(), WriteInput{FilePath: filepath.Join(dir, "d.txt"), Content: "z"})
-	if err != nil {
-		t.Fatalf("run write without a writer: %v", err)
-	}
-	if s, _ := out.(string); !strings.Contains(s, "the client does not support fs/write_text_file") {
-		t.Errorf("output = %v, want the refusal naming the missing capability", out)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "d.txt")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("stat refused file = %v, want it never written", err)
-	}
-}
-
-// TestToolEnvUsesActionContext pins the doc-aligned channel: withToolEnv
-// writes genkit's action context, keeps the keys an earlier caller set, and
-// the whole environment reads back out of it. A context no turn touched
-// carries no environment, whose writer is nil, leaving tools nowhere to write.
-func TestToolEnvUsesActionContext(t *testing.T) {
-	base := core.WithActionContext(context.Background(), core.ActionContext{"uid": "alice"})
-	stub := func(context.Context, string, string) error { return nil }
-	readStub := func(context.Context, string, *int, *int) (string, error) { return "", nil }
-	ctx := withToolEnv(base, toolEnv{cwd: "/session/dir", read: readStub, write: stub})
-
-	env := envFrom(ctx)
-	if env.cwd != "/session/dir" {
-		t.Errorf("env.cwd = %q, want the session cwd", env.cwd)
-	}
-	if env.read == nil {
-		t.Error("env.read = nil, want the reader the turn picked")
-	}
-	if env.write == nil {
-		t.Error("env.write = nil, want the writer the turn picked")
-	}
-	if uid, _ := core.FromContext(ctx)["uid"].(string); uid != "alice" {
-		t.Errorf("action context uid = %q, want it preserved", uid)
-	}
-
-	if env := envFrom(context.Background()); env.read != nil || env.write != nil || env.cwd != "" {
-		t.Errorf("env without a turn = %+v, want the zero environment", env)
-	}
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	if got := cwdFrom(context.Background()); got != wd {
-		t.Errorf("cwdFrom = %q, want the process directory %q", got, wd)
-	}
-}
-
-// TestInitializeRecordsClientCapabilities pins the gate writerFor and
-// readerFor read: what the client advertised in initialize, and nothing
-// before it.
-func TestInitializeRecordsClientCapabilities(t *testing.T) {
-	ag := New(nil, nil)
-	if ag.fsWriteCapable() {
-		t.Fatal("fsWriteCapable before initialize = true, want false")
-	}
-	if ag.fsReadCapable() {
-		t.Fatal("fsReadCapable before initialize = true, want false")
-	}
-	if _, err := ag.Initialize(context.Background(), acp.InitializeRequest{
-		ProtocolVersion: acp.ProtocolVersionNumber,
-		ClientCapabilities: acp.ClientCapabilities{
-			Fs: acp.FileSystemCapabilities{ReadTextFile: true, WriteTextFile: true},
-		},
-	}); err != nil {
-		t.Fatalf("initialize: %v", err)
-	}
-	if !ag.fsWriteCapable() {
-		t.Error("fsWriteCapable after initialize = false, want the advertised capability")
-	}
-	if !ag.fsReadCapable() {
-		t.Error("fsReadCapable after initialize = false, want the advertised capability")
-	}
-}
-
-// TestWriterForNeedsClientSupport covers the writer selection the pipes do
-// not show on their own: without a connection, writerFor hands out no writer
-// even when the capability was advertised, and without the capability it
-// never gets far enough to send anything. Nothing writes the file in its
-// place.
-func TestWriterForNeedsClientSupport(t *testing.T) {
-	capable := New(nil, nil)
-	if _, err := capable.Initialize(context.Background(), acp.InitializeRequest{
-		ProtocolVersion: acp.ProtocolVersionNumber,
-		ClientCapabilities: acp.ClientCapabilities{
-			Fs: acp.FileSystemCapabilities{WriteTextFile: true},
-		},
-	}); err != nil {
-		t.Fatalf("initialize: %v", err)
-	}
-
-	for _, tc := range []struct {
-		name string
-		ag   *Agent
-	}{
-		{"never initialized", New(nil, nil)},
-		{"capability without a connection", capable},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if w := tc.ag.writerFor("sess_x"); w != nil {
-				t.Error("writerFor = non-nil, want nil when fs/write_text_file may not be called")
-			}
-		})
-	}
-}
-
-// TestReadToolGoesOverACP drives a read round against a client that
-// advertised fs.readTextFile: the model's relative path must reach the
-// client as one fs/read_text_file request carrying the session id and the
-// absolute path under the session cwd, and the content the model sees must
-// be the client's answer, since the client is the one holding the file,
-// unsaved editor changes included.
-func TestReadToolGoesOverACP(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	cwd := t.TempDir()
-	wantPath := filepath.Join(cwd, "src", "main.go")
+	seedFile(t, filepath.Join(cwd, "src", "main.go"), "package main\n\nfunc main() {}\n")
 
 	toolCallArg := fmt.Sprintf(`{"filePath":%q}`, filepath.Join("src", "main.go"))
-	requests := startToolModel(t, "read", toolCallArg, "the file is read")
+	requests := startToolModel(t, "read_file", toolCallArg, "the file is read")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
 
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{ReadTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -456,139 +245,286 @@ func TestReadToolGoesOverACP(t *testing.T) {
 	_ = agentConn.Done()
 	_ = clientConn.Done()
 
-	reads := rc.fsReads()
-	if len(reads) != 1 {
-		t.Fatalf("fs/read_text_file requests = %+v, want exactly one", reads)
+	if reads := rc.fsReads(); len(reads) != 0 {
+		t.Errorf("fs/read_text_file requests = %+v, want none", reads)
 	}
-	r := reads[0]
-	if r.SessionId != sess.SessionId {
-		t.Errorf("sessionId = %q, want the session the turn ran on %q", r.SessionId, sess.SessionId)
-	}
-	if r.Path != wantPath {
-		t.Errorf("path = %q, want the relative one resolved to the absolute %q", r.Path, wantPath)
-	}
-	if r.Line != nil || r.Limit != nil {
-		t.Errorf("line/limit = %v/%v, want nil when the model omitted them", r.Line, r.Limit)
-	}
-
 	reqBodies := requests()
 	if len(reqBodies) != 2 {
 		t.Fatalf("model requests = %d, want 2 (tool call round)", len(reqBodies))
 	}
-	if !strings.Contains(reqBodies[1], "file body from client") {
-		t.Errorf("second request missing the content the client returned:\n%s", reqBodies[1])
+	// The second request carries the summary as the tool's result and the
+	// file itself as the injected user message behind it.
+	if !strings.Contains(reqBodies[1], "package main") {
+		t.Errorf("second request missing the file contents:\n%s", reqBodies[1])
+	}
+	// The body is JSON, where "<" arrives escaped as <, so the envelope is
+	// matched without its opening bracket.
+	if !strings.Contains(reqBodies[1], "read_file path=") {
+		t.Errorf("second request missing the injected read_file envelope:\n%s", reqBodies[1])
+	}
+
+	// The contents went to the model, not to the client: the answer channel
+	// carries the final reply and nothing else.
+	rc.testClient.mu.Lock()
+	events := append([]streamEvent(nil), rc.events...)
+	rc.testClient.mu.Unlock()
+	if got := joined(events, "message"); got != "the file is read" {
+		t.Errorf("message channel = %q, want only the final answer", got)
 	}
 }
 
-// TestRunReadResolvesRelativePath checks the read tool's own path rules: a
-// relative filePath lands under the session cwd carried in the context, an
-// absolute one is used as-is, both reach the turn's reader as absolute
-// paths, and the optional line window rides along untouched. With no reader
-// at all the tool refuses, since reading the file off the agent's own disk
-// would show the model a copy the client may already have changed.
-func TestRunReadResolvesRelativePath(t *testing.T) {
-	dir := t.TempDir()
-	refs := defineTools(genkit.Init(context.Background()))
-	if len(refs) != 2 || refs[0].Name() != "read" || refs[1].Name() != "write" {
-		t.Fatalf("registered tools = %v, want read registered before write", refs)
-	}
-	tw := refs[0].(ai.Tool)
+// TestFileToolsIgnoreClientCapabilities pins the migration: a client that
+// still advertises the fs capabilities ACP v2 removes gets its read answered
+// from the agent's own disk regardless, and none of the client's fs methods
+// are ever called. What the client would have returned is what must NOT
+// reach the model.
+func TestFileToolsIgnoreClientCapabilities(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	seedFile(t, filepath.Join(cwd, "notes.txt"), "content from the agent's disk\n")
 
-	toVal := func(p *int) int {
-		if p == nil {
-			return -1
-		}
-		return *p
-	}
-	type readRecord struct {
-		path        string
-		line, limit int
-	}
-	var reads []readRecord
-	ctx := withToolEnv(context.Background(), toolEnv{
-		cwd: dir,
-		read: func(_ context.Context, path string, line, limit *int) (string, error) {
-			reads = append(reads, readRecord{path, toVal(line), toVal(limit)})
-			return "file body", nil
-		},
+	requests := startToolModel(t, "read_file", `{"filePath":"notes.txt"}`, "the file is read")
+
+	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
+
+	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
+		Fs: acp.FileSystemCapabilities{ReadTextFile: true, WriteTextFile: true},
 	})
 
-	out, err := tw.RunRaw(ctx, ReadInput{FilePath: "a/b.txt"})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
 	if err != nil {
-		t.Fatalf("run read: %v", err)
+		t.Fatalf("new session: %v", err)
 	}
-	if s, _ := out.(string); s != "file body" {
-		t.Errorf("output = %q, want the content the reader returned", out)
-	}
-
-	abs := filepath.Join(dir, "c.txt")
-	if _, err := tw.RunRaw(ctx, ReadInput{FilePath: abs, Line: new(3), Limit: new(5)}); err != nil {
-		t.Fatalf("run read absolute: %v", err)
-	}
-
-	want := []readRecord{
-		{filepath.Join(dir, "a", "b.txt"), -1, -1},
-		{abs, 3, 5},
-	}
-	if len(reads) != len(want) {
-		t.Fatalf("reads = %+v, want %+v", reads, want)
-	}
-	for i := range want {
-		if reads[i] != want[i] {
-			t.Errorf("read %d = %+v, want %+v", i, reads[i], want[i])
-		}
-	}
-
-	// No turn, no reader: the tool reports that to the model instead of
-	// falling back to a local read the client would never see happen.
-	local := filepath.Join(dir, "local.txt")
-	if err := os.WriteFile(local, []byte("on the agent's own disk"), 0o600); err != nil {
-		t.Fatalf("write local file: %v", err)
-	}
-	out, err = tw.RunRaw(context.Background(), ReadInput{FilePath: local})
-	if err != nil {
-		t.Fatalf("run read without a reader: %v", err)
-	}
-	s, _ := out.(string)
-	if !strings.Contains(s, "the client does not support fs/read_text_file") {
-		t.Errorf("output = %v, want the refusal naming the missing capability", out)
-	}
-	if strings.Contains(s, "on the agent's own disk") {
-		t.Errorf("output = %q, want no fallback to the agent's own disk", out)
-	}
-}
-
-// TestReaderForNeedsClientSupport covers the reader selection the pipes do
-// not show on their own: without a connection, readerFor hands out no
-// reader even when the capability was advertised, and a wired connection
-// without fs.readTextFile gets none either, so the gate is the advertised
-// capability and not just the transport.
-func TestReaderForNeedsClientSupport(t *testing.T) {
-	capable := New(nil, nil)
-	if _, err := capable.Initialize(context.Background(), acp.InitializeRequest{
-		ProtocolVersion: acp.ProtocolVersionNumber,
-		ClientCapabilities: acp.ClientCapabilities{
-			Fs: acp.FileSystemCapabilities{ReadTextFile: true},
-		},
+	if _, err := clientConn.Prompt(ctx, acp.PromptRequest{
+		SessionId: sess.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("show me notes.txt")},
 	}); err != nil {
-		t.Fatalf("initialize: %v", err)
+		t.Fatalf("prompt: %v", err)
 	}
-	writeOnly, _, _, _ := openAgentPipesCaps(t, nil, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{WriteTextFile: true},
-	})
+	_ = agentConn.Done()
+	_ = clientConn.Done()
 
-	for _, tc := range []struct {
-		name string
-		ag   *Agent
-	}{
-		{"never initialized", New(nil, nil)},
-		{"capability without a connection", capable},
-		{"connection without the capability", writeOnly},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if r := tc.ag.readerFor("sess_x"); r != nil {
-				t.Error("readerFor = non-nil, want nil when fs/read_text_file may not be called")
-			}
-		})
+	if reads := rc.fsReads(); len(reads) != 0 {
+		t.Errorf("fs/read_text_file requests = %+v, want none despite the capability", reads)
+	}
+	if writes := rc.fsWrites(); len(writes) != 0 {
+		t.Errorf("fs/write_text_file requests = %+v, want none despite the capability", writes)
+	}
+	reqBodies := requests()
+	if len(reqBodies) != 2 {
+		t.Fatalf("model requests = %d, want 2 (tool call round)", len(reqBodies))
+	}
+	if !strings.Contains(reqBodies[1], "content from the agent's disk") {
+		t.Errorf("second request missing the disk contents:\n%s", reqBodies[1])
+	}
+	if strings.Contains(reqBodies[1], "file body from client") {
+		t.Errorf("second request carries the client's answer, want the agent's disk:\n%s", reqBodies[1])
+	}
+}
+
+// TestEditFileRunsAfterApprovedRead drives the flow the memoized middleware
+// exists for: the model reads, the gate holds it, the read runs on approval;
+// the model then edits, the gate holds that too, and the edit must still find
+// the file-state the read recorded — which lived in an earlier Generate of
+// this turn. Without the per-turn instance the resumed call would start with
+// an empty cache and refuse the edit as unread.
+func TestEditFileRunsAfterApprovedRead(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	wantPath := filepath.Join(cwd, "hello.txt")
+	seedFile(t, wantPath, "hello world\n")
+
+	requests := startToolModelCalls(t, func(n int) (string, string) {
+		switch n {
+		case 1:
+			return "read_file", `{"filePath":"hello.txt"}`
+		case 2:
+			return "edit_file", `{"filePath":"hello.txt","edits":[{"oldString":"hello world","newString":"hello there"}]}`
+		}
+		return "", ""
+	}, "the file is edited")
+
+	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
+
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if _, err := clientConn.Prompt(ctx, acp.PromptRequest{
+		SessionId: sess.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("change the greeting")},
+	}); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	_ = agentConn.Done()
+	_ = clientConn.Done()
+
+	// One prompt per tool: the gate held both, each ran after its own
+	// allow-once answer.
+	if perms := rc.permissionRequests(); len(perms) != 2 {
+		t.Fatalf("permission requests = %d (%+v), want one per tool", len(perms), perms)
+	}
+	data, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read edited file: %v", err)
+	}
+	if string(data) != "hello there\n" {
+		t.Errorf("file content = %q, want the edit applied", data)
+	}
+	if writes := rc.fsWrites(); len(writes) != 0 {
+		t.Errorf("fs/write_text_file requests = %+v, want none", writes)
+	}
+	if bodies := requests(); len(bodies) != 3 {
+		t.Fatalf("model requests = %d, want 3 (read round, edit round, answer)", len(bodies))
+	}
+}
+
+// TestEditFileRefusesUnreadFile checks the middleware's own guard from the
+// model's side: editing a file this turn never read fails, the file is left
+// alone, and the failure reaches the model as something it can act on.
+func TestEditFileRefusesUnreadFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	wantPath := filepath.Join(cwd, "hello.txt")
+	seedFile(t, wantPath, "hello world\n")
+
+	requests := startToolModel(t, "edit_file",
+		`{"filePath":"hello.txt","edits":[{"oldString":"hello world","newString":"hello there"}]}`,
+		"the edit is refused")
+
+	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
+
+	_, clientConn, agentConn, _ := openAgentPipes(t, g, fakeModel())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if _, err := clientConn.Prompt(ctx, acp.PromptRequest{
+		SessionId: sess.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("change the greeting")},
+	}); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	_ = agentConn.Done()
+	_ = clientConn.Done()
+
+	data, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(data) != "hello world\n" {
+		t.Errorf("file content = %q, want it untouched", data)
+	}
+	bodies := requests()
+	if len(bodies) != 2 {
+		t.Fatalf("model requests = %d, want 2", len(bodies))
+	}
+	if !strings.Contains(bodies[1], "has not been read yet") {
+		t.Errorf("second request missing the refusal the model needs:\n%s", bodies[1])
+	}
+}
+
+// TestListFilesToolListsRoot covers the tool that is always registered: one
+// listing of the workspace root comes back with what is under it, over the
+// same pipes and through the same approval as the rest.
+func TestListFilesToolListsRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	seedFile(t, filepath.Join(cwd, "a.txt"), "a\n")
+	if err := os.MkdirAll(filepath.Join(cwd, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+
+	requests := startToolModel(t, "list_files", `{}`, "the files are listed")
+
+	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
+
+	_, clientConn, agentConn, _ := openAgentPipes(t, g, fakeModel())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if _, err := clientConn.Prompt(ctx, acp.PromptRequest{
+		SessionId: sess.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("what is in here?")},
+	}); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	_ = agentConn.Done()
+	_ = clientConn.Done()
+
+	bodies := requests()
+	if len(bodies) != 2 {
+		t.Fatalf("model requests = %d, want 2 (tool call round)", len(bodies))
+	}
+	for _, want := range []string{"a.txt", "sub"} {
+		if !strings.Contains(bodies[1], want) {
+			t.Errorf("second request missing %q:\n%s", want, bodies[1])
+		}
+	}
+}
+
+// TestFileToolsConfinedToRoot checks the boundary os.Root enforces: a path
+// climbing out of the session cwd fails, the file outside it never reaches
+// the model, and the failure comes back as something the model reads.
+func TestFileToolsConfinedToRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	outer := t.TempDir()
+	cwd := filepath.Join(outer, "ws")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	secret := "TOP SECRET OUTSIDE THE ROOT\n"
+	if err := os.WriteFile(filepath.Join(outer, "secret.txt"), []byte(secret), 0o644); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	requests := startToolModel(t, "read_file", `{"filePath":"../secret.txt"}`, "never reached")
+
+	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
+
+	_, clientConn, agentConn, _ := openAgentPipes(t, g, fakeModel())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if _, err := clientConn.Prompt(ctx, acp.PromptRequest{
+		SessionId: sess.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("read the secret")},
+	}); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	_ = agentConn.Done()
+	_ = clientConn.Done()
+
+	bodies := requests()
+	if len(bodies) != 2 {
+		t.Fatalf("model requests = %d, want 2 (the refused read still answers the call)", len(bodies))
+	}
+	if strings.Contains(bodies[1], "TOP SECRET") {
+		t.Errorf("second request carries content from outside the root:\n%s", bodies[1])
+	}
+	if !strings.Contains(bodies[1], "failed") {
+		t.Errorf("second request missing the failure the model reads:\n%s", bodies[1])
 	}
 }

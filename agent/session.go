@@ -56,9 +56,10 @@ type Session struct {
 	ws    *store.Workspace
 	ready chan struct{}
 
-	// cwd is the working directory the session was opened with. Tools
-	// resolve relative paths against it; like ws it is settled before ready
-	// closes, so it needs no lock.
+	// cwd is the working directory the session was opened with. The
+	// filesystem middleware roots the model's file tools at it and the
+	// tool-call display resolves relative paths against it; like ws it is
+	// settled before ready closes, so it needs no lock.
 	cwd string
 }
 

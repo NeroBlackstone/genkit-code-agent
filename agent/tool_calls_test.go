@@ -35,10 +35,10 @@ func TestToolCallStartFilesCallUnderItsRef(t *testing.T) {
 		wantLine  *int
 	}{
 		{
-			name: "read relative path with line",
-			req: &ai.ToolRequest{Ref: "call_1", Name: "read", Input: map[string]any{
+			name: "read_file relative path with line",
+			req: &ai.ToolRequest{Ref: "call_1", Name: "read_file", Input: map[string]any{
 				"filePath": "src/main.go",
-				"line":     float64(line),
+				"offset":   float64(line),
 			}},
 			wantTitle: "Reading /workspace/src/main.go",
 			wantKind:  acp.ToolKindRead,
@@ -46,8 +46,8 @@ func TestToolCallStartFilesCallUnderItsRef(t *testing.T) {
 			wantLine:  &line,
 		},
 		{
-			name: "write absolute path",
-			req: &ai.ToolRequest{Ref: "call_2", Name: "write", Input: map[string]any{
+			name: "write_file absolute path",
+			req: &ai.ToolRequest{Ref: "call_2", Name: "write_file", Input: map[string]any{
 				"filePath": "/abs/out.txt",
 				"content":  "x",
 			}},
@@ -56,20 +56,39 @@ func TestToolCallStartFilesCallUnderItsRef(t *testing.T) {
 			wantPath:  "/abs/out.txt",
 		},
 		{
-			name:      "read without a path",
-			req:       &ai.ToolRequest{Ref: "call_3", Name: "read", Input: map[string]any{}},
+			name: "edit_file titles the edit rather than the write",
+			req: &ai.ToolRequest{Ref: "call_3", Name: "edit_file", Input: map[string]any{
+				"filePath":   "src/main.go",
+				"replaceAll": false,
+			}},
+			wantTitle: "Editing /workspace/src/main.go",
+			wantKind:  acp.ToolKindEdit,
+			wantPath:  "/workspace/src/main.go",
+		},
+		{
+			name: "list_files names the directory it lists",
+			req: &ai.ToolRequest{Ref: "call_4", Name: "list_files", Input: map[string]any{
+				"dirPath": "src",
+			}},
+			wantTitle: "Listing /workspace/src",
+			wantKind:  acp.ToolKindOther,
+			wantPath:  "/workspace/src",
+		},
+		{
+			name:      "read_file without a path",
+			req:       &ai.ToolRequest{Ref: "call_5", Name: "read_file", Input: map[string]any{}},
 			wantTitle: "Reading file",
 			wantKind:  acp.ToolKindRead,
 		},
 		{
 			name:      "unknown tool falls back to its own name",
-			req:       &ai.ToolRequest{Ref: "call_4", Name: "search", Input: map[string]any{"query": "x"}},
+			req:       &ai.ToolRequest{Ref: "call_6", Name: "search", Input: map[string]any{"query": "x"}},
 			wantTitle: "search",
 			wantKind:  acp.ToolKindOther,
 		},
 		{
 			name: "use_skill titles the skill it loads, not a path",
-			req: &ai.ToolRequest{Ref: "call_5", Name: useSkillToolName, Input: map[string]any{
+			req: &ai.ToolRequest{Ref: "call_7", Name: useSkillToolName, Input: map[string]any{
 				"skillName": "python-helper",
 			}},
 			wantTitle: "Loading skill python-helper",
@@ -146,19 +165,18 @@ func TestToolCallStartFilesCallUnderItsRef(t *testing.T) {
 // pipes and checks the creating end as the client sees it: exactly one
 // tool_call update (the streamed tool-call delta must not report the call a
 // second time), pending, naming the file the model asked for, and sent
-// before the read went over the wire.
+// before the read ran.
 func TestTurnReportsToolCallCreation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
 	wantPath := filepath.Join(cwd, "src", "main.go")
 	relative := filepath.Join("src", "main.go")
+	seedFile(t, wantPath, "package main\n")
 
-	startToolModel(t, "read", fmt.Sprintf(`{"filePath":%q}`, relative), "the file is read")
+	requests := startToolModel(t, "read_file", fmt.Sprintf(`{"filePath":%q}`, relative), "the file is read")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{ReadTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -207,11 +225,18 @@ func TestTurnReportsToolCallCreation(t *testing.T) {
 		t.Errorf("rawInput = %#v, want the model's own arguments", toolCall.RawInput)
 	}
 
-	// The create is not a stand-in for the call: the read still went over
-	// fs/read_text_file, after the client had been told about it.
-	reads := rc.fsReads()
-	if len(reads) != 1 || reads[0].Path != wantPath {
-		t.Errorf("fs/read_text_file requests = %+v, want one for %q", reads, wantPath)
+	// The create is not a stand-in for the call: the read still ran, from
+	// the agent's own disk, after the client had been told about it — and
+	// never over the removed fs/read_text_file.
+	if reads := rc.fsReads(); len(reads) != 0 {
+		t.Errorf("fs/read_text_file requests = %+v, want none", reads)
+	}
+	bodies := requests()
+	if len(bodies) != 2 {
+		t.Fatalf("model requests = %d, want 2 (tool call round)", len(bodies))
+	}
+	if !strings.Contains(bodies[1], "package main") {
+		t.Errorf("second request missing the file contents:\n%s", bodies[1])
 	}
 }
 
@@ -223,13 +248,12 @@ func TestTurnReportsToolCallLifecycle(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
 	relative := filepath.Join("src", "main.go")
+	seedFile(t, filepath.Join(cwd, relative), "package main\n")
 
-	startToolModel(t, "read", fmt.Sprintf(`{"filePath":%q}`, relative), "the file is read")
+	startToolModel(t, "read_file", fmt.Sprintf(`{"filePath":%q}`, relative), "the file is read")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(&deepseek.DeepSeek{APIKey: "test-key"}))
-	_, clientConn, agentConn, rc := openAgentPipesCaps(t, g, fakeModel(), acp.ClientCapabilities{
-		Fs: acp.FileSystemCapabilities{ReadTextFile: true},
-	})
+	_, clientConn, agentConn, rc := openAgentPipes(t, g, fakeModel())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -280,9 +304,12 @@ func TestTurnReportsToolCallLifecycle(t *testing.T) {
 		t.Errorf("status = %v, want completed", done.Status)
 	}
 	// The result is the output the model read back, not a re-run of the
-	// tool: whatever the client's fs/read_text_file answered with.
-	if done.RawOutput != "file body from client" {
-		t.Errorf("rawOutput = %#v, want the output the model saw", done.RawOutput)
+	// tool: read_file's summary of the file it found. The contents
+	// themselves travel as the injected user message, not as the call's
+	// output.
+	out, _ := done.RawOutput.(string)
+	if !strings.Contains(out, "read successfully") {
+		t.Errorf("rawOutput = %#v, want read_file's summary", done.RawOutput)
 	}
 }
 
@@ -310,7 +337,7 @@ func TestWrapToolReportsFailure(t *testing.T) {
 	boom := errors.New("boom")
 	params := &ai.ToolParams{Request: &ai.ToolRequest{
 		Ref:   "call_fail",
-		Name:  "read",
+		Name:  "read_file",
 		Input: map[string]any{"filePath": "main.go"},
 	}}
 	_, err = hooks.WrapTool(ctx, params, func(context.Context, *ai.ToolParams) (*ai.MultipartToolResponse, error) {
@@ -341,7 +368,7 @@ func TestWrapToolReportsFailure(t *testing.T) {
 	}
 
 	// No id, no report — and the tool still runs.
-	idless, err := hooks.WrapTool(ctx, &ai.ToolParams{Request: &ai.ToolRequest{Name: "read"}},
+	idless, err := hooks.WrapTool(ctx, &ai.ToolParams{Request: &ai.ToolRequest{Name: "read_file"}},
 		func(context.Context, *ai.ToolParams) (*ai.MultipartToolResponse, error) {
 			return &ai.MultipartToolResponse{Output: "ran"}, nil
 		})

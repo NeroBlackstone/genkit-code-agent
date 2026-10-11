@@ -17,8 +17,12 @@ import (
 
 const systemPrompt = `You are a coding agent. You help users with software engineering tasks:
 reading and explaining code, writing and editing files, debugging and running commands,
-answering technical questions. Use the read tool to inspect files and the write tool
-to create or overwrite files. Be direct and concise. When you change code,
+answering technical questions. All file paths are relative to the workspace root: use
+list_files to see what is there, read_file to inspect a file, write_file to create a new
+one, and edit_file to change an existing one. read_file answers with a short summary and
+delivers the file itself as a user message right after, so read a file before you edit it:
+edit_file, and write_file over an existing file, refuse work on a file you have not read
+this turn. Be direct and concise. When you change code,
 follow the existing project conventions. Never invent file paths or APIs: verify
 them before referring to them.`
 
@@ -99,19 +103,28 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 	// knows the chunks belong to one message.
 	messageID := "msg_" + uuid.New().String()
 
-	// The turn's tools get their environment here: the session cwd relative
-	// paths resolve against, and the reader and writer that take files to
-	// and from this client over fs/read_text_file and fs/write_text_file,
-	// or none when the client cannot take them. The same context carries
-	// the resume below, so the tools re-run under approval have the same
-	// environment as the ones the first call ran.
-	envCtx := withToolEnv(ctx, toolEnv{
-		cwd:   s.cwd,
-		read:  a.readerFor(string(params.SessionId)),
-		write: a.writerFor(string(params.SessionId)),
-	})
+	// The turn's file tools are genkit's Filesystem middleware rooted at the
+	// session cwd, built once here rather than per call: the approval loop
+	// below runs this turn's prompt through one Generate per interruption,
+	// and the read-before-write state an approved read_file records has to
+	// still be there when the write or edit it set up is approved in a later
+	// one.
+	fs := newTurnFilesystem(s.cwd)
 
 	stream := func(ctx context.Context, chunk *ai.ModelResponseChunk) error {
+		// Only the model's own output goes to the client: tool results
+		// arrive as tool-role chunks and the file contents read_file
+		// injects as user-role chunks, and neither is the agent's reply
+		// to stream under this turn's messageId.
+		// TODO: this filter is live-only: the dropped user-role chunks are
+		// still in resp.History(), so they persist with the transcript and
+		// session/load replays them as user messages — the UI shows the
+		// injected file contents after a reload it never streamed live.
+		// Mark injected messages on the way out (or strip them on save)
+		// so both paths agree, and give them a messageId while at it.
+		if chunk.Role != "" && chunk.Role != ai.RoleModel {
+			return nil
+		}
 		for _, part := range chunk.Content {
 			update, ok := updateForPart(part, messageID)
 			if !ok {
@@ -124,18 +137,17 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 		return nil
 	}
 
-	resp, err := genkit.Generate(envCtx, a.g,
+	resp, err := genkit.Generate(ctx, a.g,
 		ai.WithModel(ai.NewModelRef(model.Ref, model.Config)),
 		ai.WithSystem(systemPrompt),
 		ai.WithMessages(history...),
 		ai.WithPrompt(userText),
-		ai.WithTools(a.tools...),
 		// The bundle leads with the approval gate: the client hears about
 		// each tool call through the reporter's WrapModel hook the moment
 		// the model requests it, pending and before execution, but a call
 		// the gate holds never reaches the reporter's WrapTool — it stays
 		// pending until the resume either runs it or answers it.
-		ai.WithUse(a.turnMiddleware(s, params.SessionId)...),
+		ai.WithUse(a.turnMiddleware(s, params.SessionId, fs)...),
 		ai.WithStreaming(stream),
 	)
 	if err != nil {
@@ -147,7 +159,7 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 	// over session/request_permission and runs Generate again over the
 	// same conversation with the decisions attached, until the model
 	// stops pausing; what follows only ever sees a finished turn.
-	resp, err = a.resolveInterrupts(envCtx, resp, params.SessionId, s,
+	resp, err = a.resolveInterrupts(ctx, resp, params.SessionId, s,
 		func(cur *ai.ModelResponse, restarts, responds []*ai.Part) (*ai.ModelResponse, error) {
 			msgs := cur.History()
 			// The system prompt re-travels as WithSystem rather than as
@@ -156,17 +168,18 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 			if len(msgs) > 0 && msgs[0].Role == ai.RoleSystem {
 				msgs = msgs[1:]
 			}
-			return genkit.Generate(envCtx, a.g,
+			return genkit.Generate(ctx, a.g,
 				ai.WithModel(ai.NewModelRef(model.Ref, model.Config)),
 				ai.WithSystem(systemPrompt),
 				ai.WithMessages(msgs...),
-				ai.WithTools(a.tools...),
 				// The same middleware the first call carried, rebuilt so
 				// an allow_always answered earlier this turn is in the
 				// gate before this call's own tool rounds run: resume
 				// keeps the same config as the call it resumes, plus
-				// whatever the session has remembered since.
-				ai.WithUse(a.turnMiddleware(s, params.SessionId)...),
+				// whatever the session has remembered since — and the
+				// same fs, so the file-state an approved read recorded
+				// reaches the edit approved after it.
+				ai.WithUse(a.turnMiddleware(s, params.SessionId, fs)...),
 				ai.WithStreaming(stream),
 				ai.WithToolRestarts(restarts...),
 				ai.WithToolResponses(responds...),

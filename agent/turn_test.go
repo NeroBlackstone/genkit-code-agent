@@ -95,11 +95,11 @@ func TestUpdatesForReplayRebuildsToolCall(t *testing.T) {
 		ai.NewUserTextMessage("show me main.go"),
 		{Role: ai.RoleModel, Content: []*ai.Part{ai.NewToolRequestPart(&ai.ToolRequest{
 			Ref:   "call_stored",
-			Name:  "read",
-			Input: map[string]any{"filePath": "src/main.go", "line": float64(7)},
+			Name:  "read_file",
+			Input: map[string]any{"filePath": "src/main.go", "offset": float64(7)},
 		})}},
 		{Role: ai.RoleTool, Content: []*ai.Part{ai.NewToolResponsePart(&ai.ToolResponse{
-			Name: "read", Ref: "call_stored", Output: "file body",
+			Name: "read_file", Ref: "call_stored", Output: "file body",
 		})}},
 		{Role: ai.RoleModel, Metadata: map[string]any{"messageId": "msg_answer"},
 			Content: []*ai.Part{ai.NewTextPart("here it is")}},

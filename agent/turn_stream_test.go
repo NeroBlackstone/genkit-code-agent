@@ -29,10 +29,10 @@ type streamEvent struct {
 // recordingClient is the testClient with SessionUpdate overridden to record
 // both ACP channels in arrival order, which is what the split is judged on,
 // and with WriteTextFile and ReadTextFile overridden to record the
-// fs/write_text_file and fs/read_text_file requests the agent sends: what the
-// client does with the file is the client's, and the recorded request is what
-// tells a test the call went over ACP rather than through the agent's own
-// disk.
+// fs/write_text_file and fs/read_text_file requests the agent sends — of
+// which there must be none: the file tools run over genkit's Filesystem
+// middleware on the agent's own disk, and the recording is what tells a
+// test the removed client surface stayed unused.
 type recordingClient struct {
 	testClient
 	events      []streamEvent
@@ -163,8 +163,10 @@ func openAgentPipes(t *testing.T, g *genkit.Genkit, model Model) (*Agent, *acp.C
 }
 
 // openAgentPipesCaps is openAgentPipes with the capabilities the client
-// advertises in initialize, which is what an agent deciding whether it may
-// call fs/write_text_file or fs/read_text_file reads.
+// advertises in initialize. Nothing gates on them any more — the filesystem
+// half used to decide whether fs/write_text_file and fs/read_text_file could
+// be called at all — so a test passes them to prove an advertised
+// capability, the one ACP v2 removes, changes nothing.
 func openAgentPipesCaps(t *testing.T, g *genkit.Genkit, model Model, caps acp.ClientCapabilities) (*Agent, *acp.ClientSideConnection, *acp.AgentSideConnection, *recordingClient) {
 	t.Helper()
 
