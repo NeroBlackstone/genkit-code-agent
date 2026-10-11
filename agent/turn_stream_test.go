@@ -27,10 +27,45 @@ type streamEvent struct {
 }
 
 // recordingClient is the testClient with SessionUpdate overridden to record
-// both ACP channels in arrival order, which is what the split is judged on.
+// both ACP channels in arrival order, which is what the split is judged on,
+// and with WriteTextFile and ReadTextFile overridden to record the
+// fs/write_text_file and fs/read_text_file requests the agent sends: what the
+// client does with the file is the client's, and the recorded request is what
+// tells a test the call went over ACP rather than through the agent's own
+// disk.
 type recordingClient struct {
 	testClient
 	events []streamEvent
+	writes []acp.WriteTextFileRequest
+	reads  []acp.ReadTextFileRequest
+}
+
+func (c *recordingClient) WriteTextFile(_ context.Context, p acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
+	c.testClient.mu.Lock()
+	defer c.testClient.mu.Unlock()
+	c.writes = append(c.writes, p)
+	return acp.WriteTextFileResponse{}, nil
+}
+
+func (c *recordingClient) ReadTextFile(_ context.Context, p acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
+	c.testClient.mu.Lock()
+	defer c.testClient.mu.Unlock()
+	c.reads = append(c.reads, p)
+	return acp.ReadTextFileResponse{Content: "file body from client"}, nil
+}
+
+// fsWrites returns the fs/write_text_file requests recorded so far.
+func (c *recordingClient) fsWrites() []acp.WriteTextFileRequest {
+	c.testClient.mu.Lock()
+	defer c.testClient.mu.Unlock()
+	return append([]acp.WriteTextFileRequest(nil), c.writes...)
+}
+
+// fsReads returns the fs/read_text_file requests recorded so far.
+func (c *recordingClient) fsReads() []acp.ReadTextFileRequest {
+	c.testClient.mu.Lock()
+	defer c.testClient.mu.Unlock()
+	return append([]acp.ReadTextFileRequest(nil), c.reads...)
 }
 
 func (c *recordingClient) SessionUpdate(_ context.Context, p acp.SessionNotification) error {
@@ -61,8 +96,17 @@ func (c *recordingClient) SessionUpdate(_ context.Context, p acp.SessionNotifica
 
 // openAgentPipes wires a real agent and client over in-memory pipes for g and
 // model, returning the agent, the client connection to drive, and its
-// recording client.
+// recording client. The client advertises no capabilities, which is what a
+// client that supports nothing sends.
 func openAgentPipes(t *testing.T, g *genkit.Genkit, model Model) (*Agent, *acp.ClientSideConnection, *acp.AgentSideConnection, *recordingClient) {
+	t.Helper()
+	return openAgentPipesCaps(t, g, model, acp.ClientCapabilities{})
+}
+
+// openAgentPipesCaps is openAgentPipes with the capabilities the client
+// advertises in initialize, which is what an agent deciding whether it may
+// call fs/write_text_file or fs/read_text_file reads.
+func openAgentPipesCaps(t *testing.T, g *genkit.Genkit, model Model, caps acp.ClientCapabilities) (*Agent, *acp.ClientSideConnection, *acp.AgentSideConnection, *recordingClient) {
 	t.Helper()
 
 	agentToClientR, agentToClientW := io.Pipe()
@@ -76,8 +120,9 @@ func openAgentPipes(t *testing.T, g *genkit.Genkit, model Model) (*Agent, *acp.C
 	clientConn := acp.NewClientSideConnection(rc, clientToAgentW, agentToClientR)
 
 	if _, err := clientConn.Initialize(context.Background(), acp.InitializeRequest{
-		ProtocolVersion: acp.ProtocolVersionNumber,
-		ClientInfo:      &acp.Implementation{Name: "test-client", Version: "0.0.1"},
+		ProtocolVersion:    acp.ProtocolVersionNumber,
+		ClientInfo:         &acp.Implementation{Name: "test-client", Version: "0.0.1"},
+		ClientCapabilities: caps,
 	}); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}

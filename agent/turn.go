@@ -15,9 +15,9 @@ import (
 )
 
 const systemPrompt = `You are a coding agent. You help users with software engineering tasks:
-reading and explaining code, writing and editing files, debugging, running commands,
-and answering technical questions. Use the write tool to create or overwrite files;
-it creates parent directories for you. Be direct and concise. When you change code,
+reading and explaining code, writing and editing files, debugging and running commands,
+answering technical questions. Use the read tool to inspect files and the write tool
+to create or overwrite files. Be direct and concise. When you change code,
 follow the existing project conventions. Never invent file paths or APIs: verify
 them before referring to them.`
 
@@ -60,7 +60,15 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 	// knows the chunks belong to one message.
 	messageID := "msg_" + uuid.New().String()
 
-	resp, err := genkit.Generate(withCwd(ctx, s.cwd), a.g,
+	// The turn's tools get their environment here: the session cwd relative
+	// paths resolve against, and the reader and writer that take files to
+	// and from this client over fs/read_text_file and fs/write_text_file,
+	// or none when the client cannot take them.
+	resp, err := genkit.Generate(withToolEnv(ctx, toolEnv{
+		cwd:   s.cwd,
+		read:  a.readerFor(string(params.SessionId)),
+		write: a.writerFor(string(params.SessionId)),
+	}), a.g,
 		ai.WithModel(ai.NewModelRef(model.Ref, model.Config)),
 		ai.WithSystem(systemPrompt),
 		ai.WithMessages(history...),

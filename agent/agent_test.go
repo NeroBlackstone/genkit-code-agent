@@ -17,10 +17,10 @@ type testClient struct {
 var _ acp.Client = (*testClient)(nil)
 
 func (c *testClient) ReadTextFile(ctx context.Context, p acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
-	return acp.ReadTextFileResponse{}, acp.NewMethodNotFound("fs/readTextFile")
+	return acp.ReadTextFileResponse{}, acp.NewMethodNotFound(acp.ClientMethodFsReadTextFile)
 }
 func (c *testClient) WriteTextFile(ctx context.Context, p acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
-	return acp.WriteTextFileResponse{}, acp.NewMethodNotFound("fs/writeTextFile")
+	return acp.WriteTextFileResponse{}, acp.NewMethodNotFound(acp.ClientMethodFsWriteTextFile)
 }
 func (c *testClient) RequestPermission(ctx context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	return acp.RequestPermissionResponse{}, acp.NewMethodNotFound("permission/request")

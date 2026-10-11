@@ -79,6 +79,15 @@ type Agent struct {
 	// tools are the tools this agent offers the model, registered on g when
 	// one is wired and empty otherwise.
 	tools []ai.ToolRef
+
+	// capsMu guards caps: Initialize writes it on the connection's dispatch
+	// goroutine, a turn reads it on another, so the read side takes the lock
+	// instead of leaning on initialize happening first.
+	capsMu sync.RWMutex
+	// caps is what the client advertised in initialize. Only its filesystem
+	// half is consulted today, by writerFor and readerFor, which must know
+	// it before calling fs/write_text_file or fs/read_text_file.
+	caps acp.ClientCapabilities
 }
 
 var (
@@ -106,6 +115,13 @@ func (a *Agent) SetAgentConnection(conn *acp.AgentSideConnection) {
 }
 
 func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
+	// The client's half of the capability negotiation, kept so the methods
+	// it gates can be checked: fs/write_text_file may only be called once
+	// the client has said it supports it.
+	a.capsMu.Lock()
+	a.caps = params.ClientCapabilities
+	a.capsMu.Unlock()
+
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
@@ -128,6 +144,22 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (a
 			},
 		},
 	}, nil
+}
+
+// fsWriteCapable reports whether the client advertised fs.writeTextFile.
+// writerFor consults it before every turn decides where its writes go.
+func (a *Agent) fsWriteCapable() bool {
+	a.capsMu.RLock()
+	defer a.capsMu.RUnlock()
+	return a.caps.Fs.WriteTextFile
+}
+
+// fsReadCapable reports whether the client advertised fs.readTextFile.
+// readerFor consults it before every turn decides where its reads go.
+func (a *Agent) fsReadCapable() bool {
+	a.capsMu.RLock()
+	defer a.capsMu.RUnlock()
+	return a.caps.Fs.ReadTextFile
 }
 
 func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
