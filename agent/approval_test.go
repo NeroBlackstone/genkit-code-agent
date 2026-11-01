@@ -399,10 +399,12 @@ func TestToolApprovalRejectAlwaysSkipsPrompt(t *testing.T) {
 }
 
 // TestToolApprovalResumesSeveralInterruptsAtOnce drives one model response
-// asking for two tools: both are held, both get their own permission prompt
-// under the ids their creating updates were filed with, and one resume
-// restarts them together — two calls, two rounds of lifecycle updates, one
-// finished conversation.
+// asking for three tools: the pre-approved read runs straight through the
+// gate, the two writes are each held with their own permission prompt under
+// the ids their creating updates were filed with, and one resume restarts
+// them together — two calls, two rounds of lifecycle updates, one finished
+// conversation. The read in the same response also covers the mixed round:
+// its file contents must not land after the model message the resume needs.
 func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 	cwd := t.TempDir()
 	t.Setenv("HOME", cwd)
@@ -432,8 +434,9 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 		if n == 1 {
 			writeArgs := fmt.Sprintf(`{"filePath":%q,"content":"hello"}`, "out.txt")
 			readArgs := fmt.Sprintf(`{"filePath":%q}`, filepath.Join("src", "main.go"))
+			editArgs := fmt.Sprintf(`{"filePath":%q,"edits":[{"oldString":"package main","newString":"package main // edited"}]}`, filepath.Join("src", "main.go"))
 			chunks = []string{
-				fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_file","arguments":%q}},{"index":1,"id":"call_2","type":"function","function":{"name":"read_file","arguments":%q}}]},"finish_reason":null}]}`, writeArgs, readArgs),
+				fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":%q}},{"index":1,"id":"call_2","type":"function","function":{"name":"write_file","arguments":%q}},{"index":2,"id":"call_3","type":"function","function":{"name":"edit_file","arguments":%q}}]},"finish_reason":null}]}`, readArgs, writeArgs, editArgs),
 				`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 				`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
 			}
@@ -468,12 +471,13 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 	_ = agentConn.Done()
 	_ = clientConn.Done()
 
-	// One prompt per interrupt, each naming one of the creating updates.
+	// One prompt per held tool — the pre-approved read asks for none —
+	// each naming one of the creating updates.
 	perms := rc.permissionRequests()
 	if len(perms) != 2 {
 		t.Fatalf("permission requests = %d (%+v), want one per held tool", len(perms), perms)
 	}
-	events := waitForToolEvents(t, rc, 6)
+	events := waitForToolEvents(t, rc, 9)
 	created := map[acp.ToolCallId]bool{}
 	counts := map[acp.ToolCallStatus]int{}
 	for _, ev := range events {
@@ -486,8 +490,8 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 			counts[*ev.ToolCallUpdate.Status]++
 		}
 	}
-	if counts[acp.ToolCallStatusPending] != 2 || counts[acp.ToolCallStatusInProgress] != 2 || counts[acp.ToolCallStatusCompleted] != 2 {
-		t.Errorf("status counts = %v, want two of pending, in_progress, completed", counts)
+	if counts[acp.ToolCallStatusPending] != 3 || counts[acp.ToolCallStatusInProgress] != 3 || counts[acp.ToolCallStatusCompleted] != 3 {
+		t.Errorf("status counts = %v, want three of pending, in_progress, completed", counts)
 	}
 	for i, p := range perms {
 		if !created[p.ToolCall.ToolCallId] {
@@ -498,17 +502,25 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 		t.Errorf("both permissions name %q, want one per tool", perms[0].ToolCall.ToolCallId)
 	}
 
-	// One resume ran both: the write reached the agent's own disk, the
-	// read answered from it, and the model's second request carries both —
-	// the contents through the user message read_file injects, the write's
-	// result through the tool response. Nothing went over the client's
-	// removed fs surface.
+	// One resume ran both held writes: the write reached the agent's own
+	// disk, the edit found the file-state the pre-approved read recorded
+	// in the earlier Generate, and the model's second request carries the
+	// results — the read's contents through the user message read_file
+	// injects, the write's and the edit's through the tool responses.
+	// Nothing went over the client's removed fs surface.
 	data, err := os.ReadFile(writePath)
 	if err != nil {
 		t.Fatalf("read written file: %v", err)
 	}
 	if string(data) != "hello" {
 		t.Errorf("file content = %q, want what the model asked for", data)
+	}
+	edited, err := os.ReadFile(filepath.Join(cwd, "src", "main.go"))
+	if err != nil {
+		t.Fatalf("read edited file: %v", err)
+	}
+	if string(edited) != "package main // edited\n" {
+		t.Errorf("edited file content = %q, want the edit applied", edited)
 	}
 	if writes := rc.fsWrites(); len(writes) != 0 {
 		t.Errorf("fs/write_text_file requests = %+v, want none", writes)
@@ -522,7 +534,7 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 		t.Fatalf("model requests = %d, want 2", len(bodies))
 	}
 	if !strings.Contains(bodies[1], "written successfully") || !strings.Contains(bodies[1], "package main") {
-		t.Errorf("second request missing one of the two results:\n%s", bodies[1])
+		t.Errorf("second request missing one of the results:\n%s", bodies[1])
 	}
 }
 

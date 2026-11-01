@@ -12,7 +12,6 @@ import (
 
 	"genkit-code-agent/agent"
 	"genkit-code-agent/config"
-	"genkit-code-agent/oai"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/firebase/genkit/go/core/api"
@@ -210,15 +209,9 @@ func pluginFor(p config.Provider) (api.Plugin, func(config.Model) any, error) {
 		if err := requireKey("DEEPSEEK_API_KEY"); err != nil {
 			return nil, nil, err
 		}
-		// DeepSeek's thinking mode rejects any replayed assistant message
-		// that lacks reasoning_content while the request carries tools,
-		// which compat_oai produces whenever a turn's reasoning came back
-		// empty. The middleware pads the field back in at the HTTP
-		// boundary; see package oai.
-		return &deepseek.DeepSeek{APIKey: p.APIKey, Opts: append(opts(),
-			option.WithMiddleware(oai.PadAssistantReasoning))}, func(m config.Model) any {
-			// Thinking is DeepSeek's default; sending it keeps the request
-			// asking for reasoning explicitly rather than relying on that.
+		// Thinking is DeepSeek's default; sending it keeps the request
+		// asking for reasoning explicitly rather than relying on that.
+		return &deepseek.DeepSeek{APIKey: p.APIKey, Opts: opts()}, func(m config.Model) any {
 			return &deepseek.ChatConfig{
 				Temperature: m.Temperature,
 				Thinking:    &deepseek.ThinkingConfig{Type: deepseek.ThinkingTypeEnabled},

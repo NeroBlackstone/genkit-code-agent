@@ -100,7 +100,10 @@ func (f *turnFilesystem) New(ctx context.Context) (*ai.Hooks, error) {
 // On the way through it captures exactly those messages — what the
 // middleware appended after this hook's entry point, on an iteration that
 // discards them — so the flush above can deliver them at the next
-// iteration, where the middleware itself would have put them.
+// iteration, where the middleware itself would have put them. Capturing
+// alone is not enough: genkit validates a resume against the last message
+// before the rebuild drops anything, so the captured messages come back off
+// the request too.
 func (f *turnFilesystem) wrapGenerate(
 	ctx context.Context,
 	params *ai.GenerateParams,
@@ -125,6 +128,14 @@ func (f *turnFilesystem) wrapGenerate(
 			f.mu.Lock()
 			f.pending = append(f.pending, p.Request.Messages[before:]...)
 			f.mu.Unlock()
+			// The middleware appended those at this iteration's entry, and
+			// genkit validates the resume against the conversation's last
+			// message before any rebuild drops them: an injected user
+			// message sitting after the model's tool requests fails that
+			// check with "cannot resume generation". Take them back off
+			// here; the flush above re-adds them at the next iteration,
+			// where the model can see them.
+			p.Request.Messages = p.Request.Messages[:before]
 		}
 		return next(ctx, p)
 	})

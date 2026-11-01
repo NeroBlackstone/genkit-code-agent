@@ -110,8 +110,14 @@ func TestTranscriptSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read stored transcript: %v", err)
 	}
-	if len(stored) != 4 {
-		t.Fatalf("stored transcript = %d messages, want 4", len(stored))
+	// The injected working-context message leads the transcript: it was
+	// stored with the first turn and rides through the restart like
+	// everything else in the envelope.
+	if len(stored) != 5 {
+		t.Fatalf("stored transcript = %d messages, want 5 (context + two turns)", len(stored))
+	}
+	if injected, _ := stored[0].Metadata["injected"].(bool); !injected {
+		t.Errorf("first stored message metadata = %v, want injected", stored[0].Metadata)
 	}
 
 	if _, err := client2.Prompt(ctx, acp.PromptRequest{

@@ -98,6 +98,17 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 		return err
 	}
 
+	// The first turn of a session gets the working context the model has
+	// no other way to learn: it never sees a process cwd, and its file
+	// tools are rooted at the agent's fileRoot, not the session's
+	// directory. The message is a normal user message marked injected, so
+	// the model keeps it in the transcript on reload while
+	// updatesForReplay skips it and the live stream never carried it —
+	// the UI sees what it saw before, which is nothing of this.
+	if len(history) == 0 {
+		history = []*ai.Message{contextMessage(s.cwd, a.fileRoot)}
+	}
+
 	// One messageId groups every update of this turn, thinking and answer
 	// alike, which is how Kilo's ACP output labels them and how a client
 	// knows the chunks belong to one message.
@@ -250,6 +261,27 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 		slog.Warn("persist transcript", "session", params.SessionId, "error", err)
 	}
 	return nil
+}
+
+// contextMessage is the first turn's injected working-context message: the
+// session's working directory and the root the model's file tools are
+// confined to, which the fixed system prompt names only abstractly ("the
+// file root"). It rides in as a user message marked injected — the same
+// tag runTurn puts on tool-injected context — so updatesForReplay skips it
+// and the client never sees it; the model keeps it in the stored transcript
+// and so does across turns and restarts.
+func contextMessage(cwd, fileRoot string) *ai.Message {
+	text := fmt.Sprintf("(context) Working directory: %s\nFile tools are rooted at: %s", cwd, fileRoot)
+	return &ai.Message{
+		Role: ai.RoleUser,
+		Content: []*ai.Part{
+			ai.NewTextPart(text),
+		},
+		Metadata: map[string]any{
+			"injected":   true,
+			"messageId":  "msg_" + uuid.New().String(),
+		},
+	}
 }
 
 // updatesForReplay turns one stored message back into the ACP updates its

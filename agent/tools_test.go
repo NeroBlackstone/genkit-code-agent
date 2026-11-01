@@ -181,11 +181,16 @@ func TestWriteFileToolWritesOnDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read stored transcript: %v", err)
 	}
-	if len(stored) < 4 {
-		t.Fatalf("stored transcript = %d messages, want at least 4 (prompt, tool call, tool result, answer)", len(stored))
+	if len(stored) < 5 {
+		t.Fatalf("stored transcript = %d messages, want at least 5 (context, prompt, tool call, tool result, answer)", len(stored))
 	}
-	if stored[0].Text() != "write hello to out.txt" {
-		t.Errorf("first stored message = %q, want the prompt", stored[0].Text())
+	// The first turn opens with the injected working-context message —
+	// model-visible, client-invisible — and the prompt follows it.
+	if injected, _ := stored[0].Metadata["injected"].(bool); !injected {
+		t.Errorf("first stored message metadata = %v, want injected", stored[0].Metadata)
+	}
+	if stored[1].Text() != "write hello to out.txt" {
+		t.Errorf("second stored message = %q, want the prompt", stored[1].Text())
 	}
 	last := stored[len(stored)-1]
 	if last.Text() != "the file is written" {
@@ -196,7 +201,7 @@ func TestWriteFileToolWritesOnDisk(t *testing.T) {
 		t.Errorf("final messageId = %q, want msg_ prefix", gotID)
 	}
 	// The prompt keeps the id its turn named.
-	savedID, _ := stored[0].Metadata["messageId"].(string)
+	savedID, _ := stored[1].Metadata["messageId"].(string)
 	if savedID == "" || strings.HasPrefix(savedID, "msg_") {
 		t.Errorf("prompt messageId = %q, want a plain UUID", savedID)
 	}
@@ -326,11 +331,12 @@ func TestFileToolsIgnoreClientCapabilities(t *testing.T) {
 }
 
 // TestEditFileRunsAfterApprovedRead drives the flow the memoized middleware
-// exists for: the model reads, the gate holds it, the read runs on approval;
-// the model then edits, the gate holds that too, and the edit must still find
-// the file-state the read recorded — which lived in an earlier Generate of
-// this turn. Without the per-turn instance the resumed call would start with
-// an empty cache and refuse the edit as unread.
+// exists for: the model reads — read_file is pre-approved, so it runs
+// straight through the gate — and then edits, which the gate holds; the
+// edit runs on approval and must still find the file-state the read
+// recorded, which lived in the earlier Generate the read ran in. Without
+// the per-turn instance the resumed call would start with an empty cache
+// and refuse the edit as unread.
 func TestEditFileRunsAfterApprovedRead(t *testing.T) {
 	cwd := t.TempDir()
 	t.Setenv("HOME", cwd)
@@ -367,10 +373,10 @@ func TestEditFileRunsAfterApprovedRead(t *testing.T) {
 	_ = agentConn.Done()
 	_ = clientConn.Done()
 
-	// One prompt per tool: the gate held both, each ran after its own
-	// allow-once answer.
-	if perms := rc.permissionRequests(); len(perms) != 2 {
-		t.Fatalf("permission requests = %d (%+v), want one per tool", len(perms), perms)
+	// One prompt, for the edit: the read is pre-approved and ran
+	// immediately, the held edit ran after its allow-once answer.
+	if perms := rc.permissionRequests(); len(perms) != 1 {
+		t.Fatalf("permission requests = %d (%+v), want one for the held edit", len(perms), perms)
 	}
 	data, err := os.ReadFile(wantPath)
 	if err != nil {

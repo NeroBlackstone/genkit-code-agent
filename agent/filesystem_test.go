@@ -108,10 +108,11 @@ func resumeParams(messages []*ai.Message) *ai.GenerateParams {
 
 // TestTurnFilesystemRequeuesDroppedInjections covers the bookkeeping that
 // keeps read_file's injected contents from vanishing: the turn-0 resume
-// iteration is one genkit rebuilds its request on, dropping whatever the
-// hooks appended, so the middleware's injection is captured on the way
-// through and re-delivered at the next iteration — the one the model is
-// actually called on — exactly once.
+// iteration is one genkit validates the resume on, and an injected user
+// message sitting after the model's tool requests fails that check, so the
+// middleware's injection is taken back off the request on the way through
+// and re-delivered at the next iteration — the one the model is actually
+// called on — exactly once.
 func TestTurnFilesystemRequeuesDroppedInjections(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello from disk"), 0o644); err != nil {
@@ -130,17 +131,19 @@ func TestTurnFilesystemRequeuesDroppedInjections(t *testing.T) {
 	if _, err := hooks.WrapGenerate(context.Background(), resumeParams(prompt), recordNext(&droppedSeen)); err != nil {
 		t.Fatalf("wrap generate on the resume iteration: %v", err)
 	}
-	// The middleware injected into this iteration's request, and the
-	// capture held a copy back for the iteration that survives.
-	if countInjected(droppedSeen) != 1 {
-		t.Fatalf("resume iteration saw %d injections, want 1", countInjected(droppedSeen))
+	// The middleware injected into this iteration's request, but the
+	// hook took it back off: the request the resume validation runs
+	// against must still end on the model's tool requests, and the
+	// capture held the injection for the iteration that survives.
+	if countInjected(droppedSeen) != 0 {
+		t.Fatalf("resume iteration saw %d injections, want the injection taken back off", countInjected(droppedSeen))
 	}
 	if got := len(f.pending); got != 1 {
-		t.Fatalf("pending = %d messages, want the dropped injection held", got)
+		t.Fatalf("pending = %d messages, want the stripped injection held", got)
 	}
 
-	// The next iteration: genkit's rebuilt request never saw the
-	// injection, so the held copy must be re-added there.
+	// The next iteration: the stripped injection must be re-added
+	// there, exactly once.
 	next := &ai.GenerateParams{
 		Request:   &ai.ModelRequest{Messages: append([]*ai.Message(nil), prompt...)},
 		Options:   testResumeOptions(),

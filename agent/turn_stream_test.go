@@ -504,10 +504,15 @@ func TestRunTurnCarriesHistoryAcrossPrompts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read stored history: %v", err)
 	}
-	if len(history) != 4 {
-		t.Fatalf("history messages = %d, want 4 (two turns)", len(history))
+	if len(history) != 5 {
+		t.Fatalf("history messages = %d, want 5 (context + two turns)", len(history))
 	}
-	wantMeta := []string{givenID, "msg_", *second.UserMessageId, "msg_"}
+	// The injected working-context message leads: model-visible only, so
+	// it carries a msg_ id of its own and never reached the client.
+	if injected, _ := history[0].Metadata["injected"].(bool); !injected {
+		t.Errorf("history[0] metadata = %v, want injected", history[0].Metadata)
+	}
+	wantMeta := []string{"msg_", givenID, "msg_", *second.UserMessageId, "msg_"}
 	for i, want := range wantMeta {
 		got, _ := history[i].Metadata["messageId"].(string)
 		if want == "msg_" {
