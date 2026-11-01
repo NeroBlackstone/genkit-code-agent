@@ -24,6 +24,13 @@ type Provider struct {
 
 type Config struct {
 	Provider []Provider `json:"provider"`
+	// FullAccess widens the root the model's file tools are confined to.
+	// When true the root is "/", letting the model reach any directory on
+	// the machine. When false (the default) the root is the user's home
+	// directory, so the model works inside ~ but cannot touch system paths.
+	// It never affects where the store keeps conversations, which stays on
+	// the session cwd.
+	FullAccess bool `json:"fullAccess,omitempty"`
 }
 
 // Active returns the provider and model to run: the first model of the first

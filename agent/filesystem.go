@@ -35,18 +35,30 @@ type turnFilesystem struct {
 	pending []*ai.Message // injections a resume dropped, waiting to be re-added
 }
 
-// newTurnFilesystem points the middleware at the session's working
-// directory: the base the tool-call display resolves paths against and the
-// root the model's file tools may not escape. A session opened without one
-// falls back to the process directory.
-func newTurnFilesystem(cwd string) *turnFilesystem {
-	if cwd == "" {
-		if wd, err := os.Getwd(); err == nil {
-			cwd = wd
-		}
+// resolveFileRoot picks the directory the model's file tools are rooted at:
+// "/" when full access is on, the user's home directory otherwise. It is the
+// base the tool-call display resolves paths against and the root the model's
+// file tools may not escape — deliberately not the session cwd, which only
+// says where the store keeps conversations. A home that cannot be resolved
+// falls back to the process directory so the tools still have a root.
+func resolveFileRoot(fullAccess bool) string {
+	if fullAccess {
+		return "/"
 	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "/"
+}
+
+// newTurnFilesystem points the middleware at root, the directory every path
+// is confined to by os.Root.
+func newTurnFilesystem(root string) *turnFilesystem {
 	return &turnFilesystem{fs: middleware.Filesystem{
-		RootDir:          cwd,
+		RootDir:          root,
 		AllowWriteAccess: true,
 	}}
 }

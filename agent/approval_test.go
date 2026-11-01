@@ -92,8 +92,8 @@ func lastMessageIsUser(body []byte) bool {
 // own disk under the session cwd. The turn finishes with the tool's result
 // in the model's next request.
 func TestToolApprovalAsksBeforeRunning(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "out.txt")
 
 	requests := startToolModel(t, "write_file",
@@ -188,8 +188,8 @@ func TestToolApprovalAsksBeforeRunning(t *testing.T) {
 // answers the model with a response it can read — the turn still finishes,
 // on a conversation nothing is left hanging in.
 func TestToolApprovalRejectOnceSkipsTool(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "out.txt")
 
 	requests := startToolModel(t, "write_file",
@@ -270,8 +270,8 @@ func TestToolApprovalRejectOnceSkipsTool(t *testing.T) {
 // would be refused by the middleware, approval or not — and the memory of
 // the choice dies with the session, not on disk.
 func TestToolApprovalAllowAlwaysSticksToSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 
 	prompts := 0
 	requests := startRoleToolModel(t, "write_file", func() string {
@@ -336,8 +336,8 @@ func TestToolApprovalAllowAlwaysSticksToSession(t *testing.T) {
 // refused from the session's memory — one prompt in the whole session, no
 // write in either round, and the model told no both times.
 func TestToolApprovalRejectAlwaysSkipsPrompt(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "out.txt")
 
 	requests := startRoleToolModel(t, "write_file", func() string {
@@ -404,8 +404,8 @@ func TestToolApprovalRejectAlwaysSkipsPrompt(t *testing.T) {
 // restarts them together — two calls, two rounds of lifecycle updates, one
 // finished conversation.
 func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	writePath := filepath.Join(cwd, "out.txt")
 	seedFile(t, filepath.Join(cwd, "src", "main.go"), "package main\n")
 
@@ -531,8 +531,8 @@ func TestToolApprovalResumesSeveralInterruptsAtOnce(t *testing.T) {
 // cancelled, so the turn stops without an answer, without running the tool,
 // and without storing anything for a later prompt to replay.
 func TestToolApprovalCancelledPermissionEndsTurn(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "out.txt")
 
 	requests := startToolModel(t, "write_file",

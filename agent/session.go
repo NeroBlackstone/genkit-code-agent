@@ -93,7 +93,7 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 		return acp.LoadSessionResponse{}, err
 	}
 	for _, m := range msgs {
-		for _, update := range updatesForReplay(m, s.cwd) {
+		for _, update := range updatesForReplay(m, a.fileRoot) {
 			if err := a.sendUpdate(ctx, params.SessionId, update); err != nil {
 				return acp.LoadSessionResponse{}, err
 			}

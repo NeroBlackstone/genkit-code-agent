@@ -29,7 +29,7 @@ const useSkillToolName = "use_skill"
 func (a *Agent) turnMiddleware(s *Session, sid acp.SessionId, fs *turnFilesystem) []ai.Middleware {
 	return []ai.Middleware{
 		&middleware.ToolApproval{AllowedTools: append(s.allowedTools(), useSkillToolName)},
-		toolCallReporter{agent: a, sid: sid, cwd: s.cwd},
+		toolCallReporter{agent: a, sid: sid, root: a.fileRoot},
 		fs,
 		&middleware.Skills{},
 		&middleware.SoftToolErrors{},

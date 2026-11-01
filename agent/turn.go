@@ -17,7 +17,7 @@ import (
 
 const systemPrompt = `You are a coding agent. You help users with software engineering tasks:
 reading and explaining code, writing and editing files, debugging and running commands,
-answering technical questions. All file paths are relative to the workspace root: use
+answering technical questions. File paths may be absolute, or relative to the file root: use
 list_files to see what is there, read_file to inspect a file, write_file to create a new
 one, and edit_file to change an existing one. read_file answers with a short summary and
 delivers the file itself as a user message right after, so read a file before you edit it:
@@ -103,13 +103,14 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 	// knows the chunks belong to one message.
 	messageID := "msg_" + uuid.New().String()
 
-	// The turn's file tools are genkit's Filesystem middleware rooted at the
-	// session cwd, built once here rather than per call: the approval loop
-	// below runs this turn's prompt through one Generate per interruption,
-	// and the read-before-write state an approved read_file records has to
-	// still be there when the write or edit it set up is approved in a later
-	// one.
-	fs := newTurnFilesystem(s.cwd)
+	// The turn's file tools are genkit's Filesystem middleware rooted at
+	// the agent's fileRoot — "/" or home per the full_access config, not
+	// the session cwd — built once here rather than per call: the approval
+	// loop below runs this turn's prompt through one Generate per
+	// interruption, and the read-before-write state an approved read_file
+	// records has to still be there when the write or edit it set up is
+	// approved in a later one.
+	fs := newTurnFilesystem(a.fileRoot)
 
 	stream := func(ctx context.Context, chunk *ai.ModelResponseChunk) error {
 		// Only the model's own output goes to the client: tool results
@@ -178,8 +179,7 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 				// reaches the edit approved after it.
 				ai.WithUse(a.turnMiddleware(s, params.SessionId, fs)...),
 				ai.WithStreaming(stream),
-				ai.WithToolRestarts(restarts...),
-				ai.WithToolResponses(responds...),
+				ai.WithResume(append(restarts, responds...)...),
 			)
 		})
 	if err != nil {
@@ -262,7 +262,7 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 // counterpart — the transcript holds results, not progress — so a replay runs
 // a call straight from pending to its stored outcome. A message stored before
 // ids existed gets a fresh one for the replay.
-func updatesForReplay(m *ai.Message, cwd string) []acp.SessionUpdate {
+func updatesForReplay(m *ai.Message, root string) []acp.SessionUpdate {
 	if m == nil {
 		return nil
 	}
@@ -302,7 +302,7 @@ func updatesForReplay(m *ai.Message, cwd string) []acp.SessionUpdate {
 				// than as a chunk of this message: it is grouped under the
 				// id it was stored with, not under the message id the text
 				// around it rides on.
-				out = append(out, toolCallStart(part.ToolRequest, cwd))
+				out = append(out, toolCallStart(part.ToolRequest, root))
 				continue
 			}
 			if update, ok := updateForPart(part, id); ok {

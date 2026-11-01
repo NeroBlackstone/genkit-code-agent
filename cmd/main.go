@@ -60,10 +60,12 @@ func runACP() {
 
 	var g *genkit.Genkit
 	var models []agent.Model
+	fullAccess := false
 	if cfg, err := loadModelConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "gca: %v\n", err)
 		os.Exit(1)
 	} else if cfg != nil {
+		fullAccess = cfg.FullAccess
 		wires, err := wireAll(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gca: %v\n", err)
@@ -94,6 +96,9 @@ func runACP() {
 		}
 	}
 	ag := agent.New(g, models)
+	if fullAccess {
+		ag.SetFullAccess()
+	}
 
 	conn := acp.NewAgentSideConnection(ag, os.Stdout, os.Stdin)
 	conn.SetLogger(slog.Default())

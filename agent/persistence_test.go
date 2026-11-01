@@ -237,8 +237,8 @@ func TestLoadSessionReplaysTranscript(t *testing.T) {
 // under the id it was stored with, so a loaded session shows the tools it ran
 // and what they returned rather than only its text.
 func TestLoadSessionReplaysToolCall(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	relative := filepath.Join("src", "main.go")
 	wantPath := filepath.Join(cwd, relative)
 	seedFile(t, wantPath, "package main\n")

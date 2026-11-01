@@ -167,8 +167,8 @@ func TestToolCallStartFilesCallUnderItsRef(t *testing.T) {
 // second time), pending, naming the file the model asked for, and sent
 // before the read ran.
 func TestTurnReportsToolCallCreation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "src", "main.go")
 	relative := filepath.Join("src", "main.go")
 	seedFile(t, wantPath, "package main\n")
@@ -245,8 +245,8 @@ func TestTurnReportsToolCallCreation(t *testing.T) {
 // the same id going in_progress as the tool runs, then completed carrying
 // the output the model read back. Three reports, one toolCallId.
 func TestTurnReportsToolCallLifecycle(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	relative := filepath.Join("src", "main.go")
 	seedFile(t, filepath.Join(cwd, relative), "package main\n")
 
@@ -326,7 +326,7 @@ func TestWrapToolReportsFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hooks, err := toolCallReporter{agent: ag, sid: "sess_x", cwd: "/workspace"}.New(ctx)
+	hooks, err := toolCallReporter{agent: ag, sid: "sess_x", root: "/workspace"}.New(ctx)
 	if err != nil {
 		t.Fatalf("new hooks: %v", err)
 	}

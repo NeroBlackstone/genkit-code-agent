@@ -17,6 +17,13 @@ type Agent struct {
 
 	g      *genkit.Genkit
 	models []Model
+
+	// fileRoot is the directory the model's file tools are rooted at for
+	// every session, taken from the full_access config: "/" when full
+	// access is on, the user's home directory otherwise. It is settled at
+	// construction and never changes, so it needs no lock. The session cwd
+	// does not feed it — cwd only says where the store keeps conversations.
+	fileRoot string
 }
 
 var (
@@ -26,13 +33,24 @@ var (
 
 // New wires the genkit instance and the models runTurn picks from: they become
 // the model config option, and the first one is a new session's value. A nil g
-// with no models leaves the agent falling back to echoing the prompt.
+// with no models leaves the agent falling back to echoing the prompt. The file
+// tools are rooted at the user's home directory until SetFullAccess widens
+// them to "/".
 func New(g *genkit.Genkit, models []Model) *Agent {
 	return &Agent{
-		sessions: make(map[string]*Session),
-		g:        g,
-		models:   models,
+		sessions:  make(map[string]*Session),
+		g:         g,
+		models:    models,
+		fileRoot:  resolveFileRoot(false),
 	}
+}
+
+// SetFullAccess widens the file tools' root from the home directory to "/",
+// letting the model reach any directory on the machine. Config-driven: main
+// calls it when full_access is on. It must run before any turn, which the
+// startup sequence guarantees — no session exists yet when it is called.
+func (a *Agent) SetFullAccess() {
+	a.fileRoot = resolveFileRoot(true)
 }
 
 // SetAgentConnection injects the connection updates are sent over. It cannot

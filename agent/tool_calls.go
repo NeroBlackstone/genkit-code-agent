@@ -22,7 +22,10 @@ import (
 type toolCallReporter struct {
 	agent *Agent
 	sid   acp.SessionId
-	cwd   string
+	// root is the file root the middleware confines the model's file tools
+	// to; relative paths in a call are resolved against it for display, so
+	// the shown path matches where the tool actually reads or writes.
+	root string
 }
 
 func (toolCallReporter) Name() string { return "gca/tool-call-reporter" }
@@ -54,7 +57,7 @@ func (r toolCallReporter) wrapModel(ctx context.Context, params *ai.ModelParams,
 		// echoes Ref back as the call id in the follow-up request, so the
 		// rewrite stays self-consistent.
 		part.ToolRequest.Ref = "call_" + uuid.New().String()
-		if err := r.agent.sendUpdate(ctx, r.sid, toolCallStart(part.ToolRequest, r.cwd)); err != nil {
+		if err := r.agent.sendUpdate(ctx, r.sid, toolCallStart(part.ToolRequest, r.root)); err != nil {
 			return resp, err
 		}
 	}
@@ -112,9 +115,9 @@ func (r toolCallReporter) wrapTool(ctx context.Context, params *ai.ToolParams, n
 // call keeps one toolCallId from its first appearance onward. Ref is never
 // empty on either path — genkit fills in a missing one before a response
 // leaves the model (ensureToolRequestRefs).
-func toolCallStart(req *ai.ToolRequest, cwd string) acp.SessionUpdate {
+func toolCallStart(req *ai.ToolRequest, root string) acp.SessionUpdate {
 	kind, title := acp.ToolKindOther, req.Name
-	path := resolveToolPath(inputString(req.Input, "filePath"), cwd)
+	path := resolveToolPath(inputString(req.Input, "filePath"), root)
 	switch req.Name {
 	case "read_file":
 		kind, title = acp.ToolKindRead, "Reading "+pathLabel(path)
@@ -125,7 +128,7 @@ func toolCallStart(req *ai.ToolRequest, cwd string) acp.SessionUpdate {
 	case "list_files":
 		// list_files names a directory rather than a file: it titles the
 		// call after the directory and files below it get no location.
-		path = resolveToolPath(inputString(req.Input, "dirPath"), cwd)
+		path = resolveToolPath(inputString(req.Input, "dirPath"), root)
 		kind, title = acp.ToolKindOther, "Listing "+pathLabel(path)
 	case useSkillToolName:
 		// skillName names a directory under the skills library rather than
@@ -181,21 +184,21 @@ func toolCallOutcome(ref string, status acp.ToolCallStatus, output any) acp.Sess
 }
 
 // resolveToolPath turns the path the model named into the absolute one the
-// client's follow-along expects: a relative one lands under the session cwd,
+// client's follow-along expects: a relative one lands under the file root,
 // which is also the root the filesystem middleware confines its tools to, so
 // the two agree on where the file is.
-func resolveToolPath(path, cwd string) string {
+func resolveToolPath(path, root string) string {
 	if path == "" || filepath.IsAbs(path) {
 		return path
 	}
-	if cwd == "" {
+	if root == "" {
 		wd, err := os.Getwd()
 		if err != nil {
 			return path
 		}
-		cwd = wd
+		root = wd
 	}
-	return filepath.Join(cwd, path)
+	return filepath.Join(root, path)
 }
 
 // inputString reads one string field out of a tool request's decoded input.

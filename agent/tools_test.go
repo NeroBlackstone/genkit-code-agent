@@ -116,8 +116,8 @@ func seedFile(t *testing.T, path, content string) {
 // nothing goes over fs/write_text_file. The stored transcript is what the
 // round must leave behind either way.
 func TestWriteFileToolWritesOnDisk(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "sub", "out.txt")
 
 	toolCallArg := fmt.Sprintf(`{"filePath":%q,"content":"hello from tool"}`, filepath.Join("sub", "out.txt"))
@@ -218,8 +218,8 @@ func TestWriteFileToolWritesOnDisk(t *testing.T) {
 // client as the agent's own reply either: they are the model's input, not
 // the answer being streamed.
 func TestReadFileToolReadsFromDisk(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	seedFile(t, filepath.Join(cwd, "src", "main.go"), "package main\n\nfunc main() {}\n")
 
 	toolCallArg := fmt.Sprintf(`{"filePath":%q}`, filepath.Join("src", "main.go"))
@@ -279,8 +279,8 @@ func TestReadFileToolReadsFromDisk(t *testing.T) {
 // are ever called. What the client would have returned is what must NOT
 // reach the model.
 func TestFileToolsIgnoreClientCapabilities(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	seedFile(t, filepath.Join(cwd, "notes.txt"), "content from the agent's disk\n")
 
 	requests := startToolModel(t, "read_file", `{"filePath":"notes.txt"}`, "the file is read")
@@ -332,8 +332,8 @@ func TestFileToolsIgnoreClientCapabilities(t *testing.T) {
 // this turn. Without the per-turn instance the resumed call would start with
 // an empty cache and refuse the edit as unread.
 func TestEditFileRunsAfterApprovedRead(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "hello.txt")
 	seedFile(t, wantPath, "hello world\n")
 
@@ -391,8 +391,8 @@ func TestEditFileRunsAfterApprovedRead(t *testing.T) {
 // model's side: editing a file this turn never read fails, the file is left
 // alone, and the failure reaches the model as something it can act on.
 func TestEditFileRefusesUnreadFile(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	wantPath := filepath.Join(cwd, "hello.txt")
 	seedFile(t, wantPath, "hello world\n")
 
@@ -440,8 +440,8 @@ func TestEditFileRefusesUnreadFile(t *testing.T) {
 // listing of the workspace root comes back with what is under it, over the
 // same pipes and through the same approval as the rest.
 func TestListFilesToolListsRoot(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	seedFile(t, filepath.Join(cwd, "a.txt"), "a\n")
 	if err := os.MkdirAll(filepath.Join(cwd, "sub"), 0o755); err != nil {
 		t.Fatalf("mkdir sub: %v", err)
@@ -481,15 +481,14 @@ func TestListFilesToolListsRoot(t *testing.T) {
 }
 
 // TestFileToolsConfinedToRoot checks the boundary os.Root enforces: a path
-// climbing out of the session cwd fails, the file outside it never reaches
-// the model, and the failure comes back as something the model reads.
+// climbing out of the file root fails, the file outside it never reaches
+// the model, and the failure comes back as something the model reads. The
+// root is now the home directory, so HOME is the root and the secret lives
+// outside it.
 func TestFileToolsConfinedToRoot(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	t.Setenv("HOME", root)
 	outer := t.TempDir()
-	cwd := filepath.Join(outer, "ws")
-	if err := os.MkdirAll(cwd, 0o755); err != nil {
-		t.Fatalf("mkdir workspace: %v", err)
-	}
 	secret := "TOP SECRET OUTSIDE THE ROOT\n"
 	if err := os.WriteFile(filepath.Join(outer, "secret.txt"), []byte(secret), 0o644); err != nil {
 		t.Fatalf("write secret: %v", err)
@@ -504,7 +503,7 @@ func TestFileToolsConfinedToRoot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}})
+	sess, err := clientConn.NewSession(ctx, acp.NewSessionRequest{Cwd: root, McpServers: []acp.McpServer{}})
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
