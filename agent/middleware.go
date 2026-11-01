@@ -19,11 +19,19 @@ const useSkillToolName = "use_skill"
 // follows it is approved. use_skill is pre-approved — it only reads a local
 // file. Skills takes genkit's default: a "skills" directory under the
 // process working directory, empty when absent.
+//
+// SoftToolErrors covers every tool: a wrong file path or bad query comes
+// back to the model as {"error": ...} for it to correct, rather than ending
+// the turn. It leaves the gate's interrupts alone — a call held for
+// approval still reaches the client — and the reporter still files each
+// error as a failed call, so the client sees the failure the model then
+// retries under a new call.
 func (a *Agent) turnMiddleware(s *Session, sid acp.SessionId, fs *turnFilesystem) []ai.Middleware {
 	return []ai.Middleware{
 		&middleware.ToolApproval{AllowedTools: append(s.allowedTools(), useSkillToolName)},
 		toolCallReporter{agent: a, sid: sid, cwd: s.cwd},
 		fs,
 		&middleware.Skills{},
+		&middleware.SoftToolErrors{},
 	}
 }
