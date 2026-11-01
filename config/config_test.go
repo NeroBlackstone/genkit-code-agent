@@ -19,7 +19,8 @@ func write(t *testing.T, body string) string {
 const valid = `{
   "provider": [
     {
-      "name": "deepseek",
+      "name": "ds",
+      "provider": "deepseek",
       "baseUrl": "https://api.deepseek.com",
       "apiKey": "k",
       "model": [
@@ -27,7 +28,7 @@ const valid = `{
         {"id": "deepseek-chat"}
       ]
     },
-    {"name": "openai", "baseUrl": "https://api.openai.com/v1", "model": [{"id": "gpt-4o-mini"}]}
+    {"name": "gpt", "provider": "openai", "baseUrl": "https://api.openai.com/v1", "model": [{"id": "gpt-4o-mini"}]}
   ]
 }`
 
@@ -40,8 +41,8 @@ func TestLoadMultiProvider(t *testing.T) {
 		t.Fatalf("providers = %d, want 2", len(cfg.Provider))
 	}
 	p, m := cfg.Active()
-	if p.Name != "deepseek" || m.ID != "deepseek-flash" {
-		t.Fatalf("Active = %s/%s, want deepseek/deepseek-flash", p.Name, m.ID)
+	if p.Name != "ds" || p.Provider != "deepseek" || m.ID != "deepseek-flash" {
+		t.Fatalf("Active = %s(%s)/%s, want ds(deepseek)/deepseek-flash", p.Name, p.Provider, m.ID)
 	}
 	if len(cfg.Provider[0].Model) != 2 || cfg.Provider[0].Model[1].ID != "deepseek-chat" {
 		t.Fatalf("first provider models = %+v", cfg.Provider[0].Model)
@@ -57,9 +58,10 @@ func TestLoadErrors(t *testing.T) {
 	}{
 		{"empty", `{"provider": []}`, "at least one provider"},
 		{"missing name", `{"provider": [{"model": [{"id": "m"}]}]}`, "provider[0].name"},
-		{"duplicate name", `{"provider": [{"name": "a", "model": [{"id": "m"}]}, {"name": "a", "model": [{"id": "m"}]}]}`, "duplicate provider"},
-		{"no models", `{"provider": [{"name": "a"}]}`, "at least one model"},
-		{"missing model id", `{"provider": [{"name": "a", "model": [{}]}]}`, "model[0].id"},
+		{"duplicate name", `{"provider": [{"name": "a", "provider": "openai-compatible", "model": [{"id": "m"}]}, {"name": "a", "provider": "openai-compatible", "model": [{"id": "m"}]}]}`, "duplicate provider"},
+		{"missing provider", `{"provider": [{"name": "a", "model": [{"id": "m"}]}]}`, "the provider field is required"},
+		{"no models", `{"provider": [{"name": "a", "provider": "openai-compatible"}]}`, "at least one model"},
+		{"missing model id", `{"provider": [{"name": "a", "provider": "openai-compatible", "model": [{}]}]}`, "model[0].id"},
 		{"bad json", `{`, "parse config"},
 	}
 	for _, tc := range cases {

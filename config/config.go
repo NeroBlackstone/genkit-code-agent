@@ -12,11 +12,14 @@ type Model struct {
 	Temperature *float64 `json:"temperature,omitempty"`
 }
 
+// Provider is one configured provider. Name identifies it — the selector's
+// group header — while Provider names the plugin that serves it.
 type Provider struct {
-	Name    string  `json:"name"`
-	BaseURL string  `json:"baseUrl"`
-	APIKey  string  `json:"apiKey"`
-	Model   []Model `json:"model"`
+	Name     string  `json:"name"`
+	Provider string  `json:"provider"`
+	BaseURL  string  `json:"baseUrl"`
+	APIKey   string  `json:"apiKey"`
+	Model    []Model `json:"model"`
 }
 
 type Config struct {
@@ -61,6 +64,9 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("config %s: duplicate provider %q", path, p.Name)
 		}
 		seen[p.Name] = true
+		if p.Provider == "" {
+			return nil, fmt.Errorf("config %s: provider %q: the provider field is required", path, p.Name)
+		}
 		if len(p.Model) == 0 {
 			return nil, fmt.Errorf("config %s: provider %q: at least one model is required", path, p.Name)
 		}

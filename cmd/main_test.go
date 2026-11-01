@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"genkit-code-agent/config"
@@ -22,46 +23,85 @@ func clearKeyEnvs(t *testing.T) {
 	}
 }
 
-func provider(name string) config.Provider {
-	return config.Provider{Name: name, APIKey: "k", Model: []config.Model{{ID: "m"}}}
+// provider builds a provider entry whose name and provider value match, the
+// simple shape of a config naming a dedicated plugin.
+func provider(plugin string) config.Provider {
+	return config.Provider{Name: plugin, Provider: plugin, APIKey: "k", Model: []config.Model{{ID: "m"}}}
+}
+
+// wiredFor wires p and fails the test if it does not wire.
+func wiredFor(t *testing.T, p config.Provider) wired {
+	t.Helper()
+	w, err := wire(p)
+	if err != nil {
+		t.Fatalf("wire(%q): %v", p.Provider, err)
+	}
+	return w
 }
 
 func TestWireDedicatedPlugins(t *testing.T) {
 	clearKeyEnvs(t)
 	for _, name := range []string{"openai", "anthropic", "dashscope", "deepseek", "kimi", "openrouter", "xai", "zai"} {
-		if _, ok := wire(provider(name)).plugin.(*compat_oai.OpenAICompatible); ok {
+		if _, ok := wiredFor(t, provider(name)).plugin.(*compat_oai.OpenAICompatible); ok {
 			t.Errorf("wire(%q) served by the generic plugin, want the dedicated one", name)
 		}
 	}
 }
 
-func TestWireFallsBackToGeneric(t *testing.T) {
+// TestWireGeneric checks the explicit openai-compatible value: it needs no
+// key, and the plugin registers models under the entry's own name.
+func TestWireGeneric(t *testing.T) {
 	clearKeyEnvs(t)
-	cases := []struct {
-		name string
-		p    config.Provider
-	}{
-		{"unknown provider", config.Provider{Name: "myproxy", Model: []config.Model{{ID: "m"}}}},
-		{"no key anywhere", config.Provider{Name: "deepseek", Model: []config.Model{{ID: "m"}}}},
+	p := config.Provider{Name: "myproxy", Provider: "openai-compatible", Model: []config.Model{{ID: "m"}}}
+	w := wiredFor(t, p)
+	plugin, ok := w.plugin.(*compat_oai.OpenAICompatible)
+	if !ok {
+		t.Fatalf("plugin = %T, want *compat_oai.OpenAICompatible", w.plugin)
 	}
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			w := wire(tt.p)
-			if _, ok := w.plugin.(*compat_oai.OpenAICompatible); !ok {
-				t.Fatalf("plugin = %T, want *compat_oai.OpenAICompatible", w.plugin)
-			}
-			if _, ok := w.modelConfig(config.Model{ID: "m"}).(*openaiGo.ChatCompletionNewParams); !ok {
-				t.Fatalf("model config = %T, want *openaiGo.ChatCompletionNewParams", w.modelConfig(config.Model{ID: "m"}))
-			}
-		})
+	if plugin.Provider != "myproxy" {
+		t.Errorf("plugin provider = %q, want the entry name %q", plugin.Provider, "myproxy")
+	}
+}
+
+// TestWireUnknownProvider checks that an unknown provider value is an error
+// rather than a silent fallthrough to the generic plugin.
+func TestWireUnknownProvider(t *testing.T) {
+	clearKeyEnvs(t)
+	p := config.Provider{Name: "myproxy", Provider: "myproxy", Model: []config.Model{{ID: "m"}}}
+	if _, err := wire(p); err == nil || !strings.Contains(err.Error(), `unknown provider "myproxy"`) {
+		t.Fatalf("err = %v, want unknown provider", err)
+	}
+}
+
+// TestWireDedicatedWithoutKey checks that a dedicated plugin with no key
+// anywhere is an error rather than a fallthrough to the generic plugin.
+func TestWireDedicatedWithoutKey(t *testing.T) {
+	clearKeyEnvs(t)
+	p := config.Provider{Name: "ds", Provider: "deepseek", Model: []config.Model{{ID: "m"}}}
+	if _, err := wire(p); err == nil || !strings.Contains(err.Error(), "no API key") {
+		t.Fatalf("err = %v, want a missing key error", err)
 	}
 }
 
 func TestWireKeyFromEnvironment(t *testing.T) {
 	clearKeyEnvs(t)
 	t.Setenv("DEEPSEEK_API_KEY", "from-env")
-	if _, ok := wire(provider("deepseek")).plugin.(*deepseek.DeepSeek); !ok {
+	if _, ok := wiredFor(t, provider("deepseek")).plugin.(*deepseek.DeepSeek); !ok {
 		t.Fatal("deepseek with a key only in the environment is not served by its plugin")
+	}
+}
+
+// TestWireAllRefusesDuplicatePlugin checks that two entries naming the same
+// dedicated plugin are refused: they would collide on the plugin's fixed
+// registration name rather than add a second provider.
+func TestWireAllRefusesDuplicatePlugin(t *testing.T) {
+	clearKeyEnvs(t)
+	cfg := &config.Config{Provider: []config.Provider{
+		provider("deepseek"),
+		{Name: "ds-proxy", Provider: "deepseek", APIKey: "k", Model: []config.Model{{ID: "m"}}},
+	}}
+	if _, err := wireAll(cfg); err == nil || !strings.Contains(err.Error(), "both register") {
+		t.Fatalf("err = %v, want a duplicate plugin error", err)
 	}
 }
 
@@ -69,7 +109,7 @@ func TestModelConfig(t *testing.T) {
 	clearKeyEnvs(t)
 	temp := 0.7
 
-	if cfg, ok := wire(provider("deepseek")).modelConfig(config.Model{ID: "m", Temperature: &temp}).(*deepseek.ChatConfig); !ok {
+	if cfg, ok := wiredFor(t, provider("deepseek")).modelConfig(config.Model{ID: "m", Temperature: &temp}).(*deepseek.ChatConfig); !ok {
 		t.Fatalf("deepseek config = %T, want *deepseek.ChatConfig", cfg)
 	} else {
 		if cfg.Temperature == nil || *cfg.Temperature != temp {
@@ -81,20 +121,20 @@ func TestModelConfig(t *testing.T) {
 	}
 
 	// Kimi's config has no temperature field to carry it.
-	if cfg, ok := wire(provider("kimi")).modelConfig(config.Model{ID: "m", Temperature: &temp}).(*kimi.ChatConfig); !ok {
+	if cfg, ok := wiredFor(t, provider("kimi")).modelConfig(config.Model{ID: "m", Temperature: &temp}).(*kimi.ChatConfig); !ok {
 		t.Fatalf("kimi config = %T, want *kimi.ChatConfig", cfg)
 	} else if cfg == nil {
 		t.Fatal("kimi config is nil")
 	}
 
-	if cfg, ok := wire(provider("openai")).modelConfig(config.Model{ID: "m", Temperature: &temp}).(*openaiGo.ChatCompletionNewParams); !ok {
+	if cfg, ok := wiredFor(t, provider("openai")).modelConfig(config.Model{ID: "m", Temperature: &temp}).(*openaiGo.ChatCompletionNewParams); !ok {
 		t.Fatalf("openai config = %T, want *openaiGo.ChatCompletionNewParams", cfg)
 	} else if !cfg.Temperature.Valid() || cfg.Temperature.Value != temp {
 		t.Errorf("temperature = %v, want %v", cfg.Temperature.Value, temp)
 	}
 
-	unknown := config.Provider{Name: "myproxy", Model: []config.Model{{ID: "m"}}}
-	if cfg, ok := wire(unknown).modelConfig(config.Model{ID: "m"}).(*openaiGo.ChatCompletionNewParams); !ok {
+	generic := config.Provider{Name: "myproxy", Provider: "openai-compatible", Model: []config.Model{{ID: "m"}}}
+	if cfg, ok := wiredFor(t, generic).modelConfig(config.Model{ID: "m"}).(*openaiGo.ChatCompletionNewParams); !ok {
 		t.Fatalf("generic config = %T, want *openaiGo.ChatCompletionNewParams", cfg)
 	} else if cfg == nil {
 		t.Fatal("generic config is nil")

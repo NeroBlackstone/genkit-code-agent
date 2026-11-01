@@ -524,7 +524,10 @@ func TestFileToolsConfinedToRoot(t *testing.T) {
 	if strings.Contains(bodies[1], "TOP SECRET") {
 		t.Errorf("second request carries content from outside the root:\n%s", bodies[1])
 	}
-	if !strings.Contains(bodies[1], "failed") {
+	// The refusal reaches the model as the call's own response,
+	// {"error": "..."} — genkit 1.14 returns file-tool failures to the
+	// model instead of injecting them as a user message.
+	if !strings.Contains(bodies[1], "path escapes from parent") {
 		t.Errorf("second request missing the failure the model reads:\n%s", bodies[1])
 	}
 }

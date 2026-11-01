@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 
 	"genkit-code-agent/agent"
 	"genkit-code-agent/config"
@@ -63,23 +64,28 @@ func runACP() {
 		fmt.Fprintf(os.Stderr, "gca: %v\n", err)
 		os.Exit(1)
 	} else if cfg != nil {
-		wires := make([]wired, 0, len(cfg.Provider))
-		plugins := make([]api.Plugin, 0, len(cfg.Provider))
-		for _, p := range cfg.Provider {
-			w := wire(p)
-			wires = append(wires, w)
+		wires, err := wireAll(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gca: %v\n", err)
+			os.Exit(1)
+		}
+		plugins := make([]api.Plugin, 0, len(wires))
+		for _, w := range wires {
 			plugins = append(plugins, w.plugin)
 		}
 		g = genkit.Init(ctx, genkit.WithPlugins(plugins...))
 
 		// Every configured model becomes a value of the model config option,
 		// in config order, so the first one is both a new session's default
-		// and what Config.Active names.
+		// and what Config.Active names. The ref is prefixed with the plugin's
+		// own name, the one it registers models under: a dedicated plugin's
+		// fixed name, the entry's name for the generic plugin, whose Provider
+		// field is set from it.
 		models = make([]agent.Model, 0, len(cfg.Provider))
 		for i, p := range cfg.Provider {
 			for _, m := range p.Model {
 				models = append(models, agent.Model{
-					Ref:    p.Name + "/" + m.ID,
+					Ref:    wires[i].plugin.Name() + "/" + m.ID,
 					Name:   m.ID,
 					Group:  p.Name,
 					Config: wires[i].modelConfig(m),
@@ -121,65 +127,83 @@ type wired struct {
 	modelConfig func(config.Model) any
 }
 
-// wire picks the plugin for a provider: the dedicated Genkit plugin for the
-// names in dedicated(), the generic OpenAI-compatible plugin for anything else
-// and for a dedicated provider configured without a usable API key, since all
-// of them but Anthropic panic at Init without one.
-func wire(p config.Provider) wired {
-	if plugin, modelConfig := dedicated(p); plugin != nil {
-		return wired{plugin: plugin, modelConfig: modelConfig}
+// wireAll wires every configured provider, in order, refusing two providers
+// that register the same plugin name: a dedicated plugin registers its models
+// under a fixed name it does not take from the config, so a second entry for
+// it would collide in genkit's registry rather than add a provider.
+func wireAll(cfg *config.Config) ([]wired, error) {
+	wires := make([]wired, 0, len(cfg.Provider))
+	at := make(map[string]string, len(cfg.Provider))
+	for _, p := range cfg.Provider {
+		w, err := wire(p)
+		if err != nil {
+			return nil, err
+		}
+		if other, ok := at[w.plugin.Name()]; ok {
+			return nil, fmt.Errorf("config: providers %q and %q both register the plugin %q", other, p.Name, w.plugin.Name())
+		}
+		at[w.plugin.Name()] = p.Name
+		wires = append(wires, w)
 	}
-	return wired{
-		plugin: &compat_oai.OpenAICompatible{
-			Provider: p.Name,
-			APIKey:   p.APIKey,
-			BaseURL:  p.BaseURL,
-		},
-		modelConfig: sdkModelConfig,
-	}
+	return wires, nil
 }
 
-// dedicated returns the dedicated plugin covering p and the config its models
-// take, or nil when p.Name has no dedicated plugin or p supplies no key and the
-// plugin's environment variables are empty too. The base URL from the config
-// is applied through Opts, which every plugin composes after its own default,
-// so it wins.
-func dedicated(p config.Provider) (api.Plugin, func(config.Model) any) {
+// wire picks the plugin the provider field names: a dedicated Genkit plugin
+// for the names in pluginFor, the generic OpenAI-compatible plugin for
+// "openai-compatible". There is no fallback: a name outside that set, or a
+// dedicated plugin left without a usable API key, is an error rather than a
+// silent detour through the generic plugin pointed at some other endpoint
+// than the config asked for.
+func wire(p config.Provider) (wired, error) {
+	plugin, modelConfig, err := pluginFor(p)
+	if err != nil {
+		return wired{}, err
+	}
+	return wired{plugin: plugin, modelConfig: modelConfig}, nil
+}
+
+// pluginFor returns the plugin serving p and the config its models take. The
+// base URL from the config is applied through Opts, which every plugin
+// composes after its own default, so it wins.
+func pluginFor(p config.Provider) (api.Plugin, func(config.Model) any, error) {
 	opts := func() []option.RequestOption {
 		if p.BaseURL == "" {
 			return nil
 		}
 		return []option.RequestOption{option.WithBaseURL(p.BaseURL)}
 	}
-	hasKey := func(envs ...string) bool {
+	// requireKey fails when p supplies no key and neither do the plugin's
+	// environment variables: all of the dedicated plugins but Anthropic
+	// panic at Init without one.
+	requireKey := func(envs ...string) error {
 		if p.APIKey != "" {
-			return true
+			return nil
 		}
 		for _, env := range envs {
 			if os.Getenv(env) != "" {
-				return true
+				return nil
 			}
 		}
-		return false
+		return fmt.Errorf("config: provider %q: no API key: set apiKey or %s", p.Name, strings.Join(envs, ", "))
 	}
 
-	switch p.Name {
+	switch p.Provider {
 	case "anthropic":
 		// Anthropic registers its models with no key; the missing one surfaces
 		// on the request rather than at Init, so no key check here.
 		return &anthropic.Anthropic{APIKey: p.APIKey, Opts: opts()}, func(m config.Model) any {
 			return &anthropic.ChatConfig{Temperature: m.Temperature}
-		}
+		}, nil
 	case "dashscope":
-		if !hasKey("DASHSCOPE_API_KEY") {
-			return nil, nil
+		if err := requireKey("DASHSCOPE_API_KEY"); err != nil {
+			return nil, nil, err
 		}
 		return &dashscope.DashScope{APIKey: p.APIKey, Opts: opts()}, func(m config.Model) any {
 			return &dashscope.ChatConfig{Temperature: m.Temperature}
-		}
+		}, nil
 	case "deepseek":
-		if !hasKey("DEEPSEEK_API_KEY") {
-			return nil, nil
+		if err := requireKey("DEEPSEEK_API_KEY"); err != nil {
+			return nil, nil, err
 		}
 		// DeepSeek's thinking mode rejects any replayed assistant message
 		// that lacks reasoning_content while the request carries tools,
@@ -194,44 +218,51 @@ func dedicated(p config.Provider) (api.Plugin, func(config.Model) any) {
 				Temperature: m.Temperature,
 				Thinking:    &deepseek.ThinkingConfig{Type: deepseek.ThinkingTypeEnabled},
 			}
-		}
+		}, nil
 	case "kimi":
-		if !hasKey("KIMI_API_KEY", "MOONSHOT_API_KEY") {
-			return nil, nil
+		if err := requireKey("KIMI_API_KEY", "MOONSHOT_API_KEY"); err != nil {
+			return nil, nil, err
 		}
 		// Kimi's config takes no temperature: the K-series drops it, so the
 		// configured value has nowhere to go.
 		return &kimi.Kimi{APIKey: p.APIKey, Opts: opts()}, func(config.Model) any {
 			return &kimi.ChatConfig{}
-		}
+		}, nil
 	case "openai":
-		if !hasKey("OPENAI_API_KEY") {
-			return nil, nil
+		if err := requireKey("OPENAI_API_KEY"); err != nil {
+			return nil, nil, err
 		}
-		return &openai.OpenAI{APIKey: p.APIKey, Opts: opts()}, sdkModelConfig
+		return &openai.OpenAI{APIKey: p.APIKey, Opts: opts()}, sdkModelConfig, nil
+	case "openai-compatible":
+		// A proxy behind the generic plugin needs no auth, so no key check.
+		return &compat_oai.OpenAICompatible{
+			Provider: p.Name,
+			APIKey:   p.APIKey,
+			BaseURL:  p.BaseURL,
+		}, sdkModelConfig, nil
 	case "openrouter":
-		if !hasKey("OPENROUTER_API_KEY") {
-			return nil, nil
+		if err := requireKey("OPENROUTER_API_KEY"); err != nil {
+			return nil, nil, err
 		}
 		return &openrouter.OpenRouter{APIKey: p.APIKey, Opts: opts()}, func(m config.Model) any {
 			return &openrouter.ChatConfig{Temperature: m.Temperature}
-		}
+		}, nil
 	case "xai":
-		if !hasKey("XAI_API_KEY") {
-			return nil, nil
+		if err := requireKey("XAI_API_KEY"); err != nil {
+			return nil, nil, err
 		}
 		return &xai.XAI{APIKey: p.APIKey, Opts: opts()}, func(m config.Model) any {
 			return &xai.ChatConfig{Temperature: m.Temperature}
-		}
+		}, nil
 	case "zai":
-		if !hasKey("ZAI_API_KEY") {
-			return nil, nil
+		if err := requireKey("ZAI_API_KEY"); err != nil {
+			return nil, nil, err
 		}
 		return &zai.ZAI{APIKey: p.APIKey, Opts: opts()}, func(m config.Model) any {
 			return &zai.ChatConfig{Temperature: m.Temperature}
-		}
+		}, nil
 	}
-	return nil, nil
+	return nil, nil, fmt.Errorf("config: provider %q: unknown provider %q", p.Name, p.Provider)
 }
 
 // sdkModelConfig builds the OpenAI SDK request params the generic plugin, and

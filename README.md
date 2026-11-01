@@ -22,7 +22,8 @@ Model config lives at `~/.gca/gca.json`:
 {
   "provider": [
     {
-      "name": "myprovider",
+      "name": "myproxy",
+      "provider": "openai-compatible",
       "baseUrl": "https://api.openai.com/v1",
       "apiKey": "",
       "model": [
@@ -34,7 +35,8 @@ Model config lives at `~/.gca/gca.json`:
       ]
     },
     {
-      "name": "deepseek",
+      "name": "ds",
+      "provider": "deepseek",
       "baseUrl": "https://api.deepseek.com",
       "apiKey": "",
       "model": [
@@ -45,9 +47,9 @@ Model config lives at `~/.gca/gca.json`:
 }
 ```
 
-- `provider` is an array of providers. A `name` from the table below is served by that provider's dedicated plugin; any other name, and a named provider configured without an API key while its key environment variables are empty, is served by the base `compat_oai.OpenAICompatible` plugin, since the dedicated plugins panic at startup with no key. `name` is the model ID prefix (the full model reference is `name/id`), `baseUrl` is the endpoint the plugin is pointed at, `apiKey` authenticates the requests (empty means no auth). Names must be unique; every provider needs at least one model.
+- `provider` is an array of providers. `name` only identifies an entry — it is the group header its models show under in the model selector and, for `openai-compatible`, the prefix on its model references (`name/id`); a dedicated plugin's references carry the plugin's own name instead. `provider` names the plugin that serves the entry: one of the names in the table below, or `openai-compatible` for the base `compat_oai.OpenAICompatible` plugin. There is no fallback — an unknown name, or a dedicated plugin configured without an API key while its key environment variables are empty, is a startup error, since the dedicated plugins panic at startup with no key and a typo would otherwise be served by a different plugin than the config asked for. `baseUrl` is the endpoint the plugin is pointed at, `apiKey` authenticates the requests (empty means no auth; `openai-compatible` needs none). Names must be unique, every provider needs at least one model, and two entries may not name the same dedicated plugin — it registers its models under a fixed name, so a second entry would collide rather than add a provider (`openai-compatible` may repeat, one plugin per entry).
 - `model` is the array of models served by that provider: `id` is the model name, `temperature` is an optional sampling setting, applied through the provider's own config type (Kimi's has no temperature field, so it is dropped there). DeepSeek requests also carry `thinking: {"type": "enabled"}` so reasoning is asked for explicitly. `max_tokens` is never sent; the endpoint's default output cap applies.
-- Every configured model is exposed to the client as an ACP session config option (`category: "model"`, grouped by provider). The client switches with `session/set_config_option`, which changes the model for that session only; a new session starts on the first model of the first provider, what `Config.Active` names.
+- Every configured model is exposed to the client as an ACP session config option (`category: "model"`, grouped by the entry's `name`). The client switches with `session/set_config_option`, which changes the model for that session only; a new session starts on the first model of the first provider, what `Config.Active` names.
 - If `~/.gca/gca.json` is absent the agent runs without a model and echoes prompts; a present-but-invalid file is a startup error.
 
 ## Sessions
@@ -76,7 +78,7 @@ A `skills/` directory against the agent's process working directory holds one sk
 
 ## Supported providers
 
-Dedicated plugins under `github.com/firebase/genkit/go/plugins/compat_oai/`:
+The `provider` field takes the name of a dedicated plugin under `github.com/firebase/genkit/go/plugins/compat_oai/`:
 
 | Plugin | Models | API key | Base URL |
 |---|---|---|---|
@@ -89,4 +91,4 @@ Dedicated plugins under `github.com/firebase/genkit/go/plugins/compat_oai/`:
 | [`xai`](https://genkit.dev/docs/go/integrations/xai/) | xAI Grok models | `XAI_API_KEY` | `XAI_BASE_URL` |
 | [`zai`](https://genkit.dev/docs/go/integrations/zai/) | Z.ai GLM models | `ZAI_API_KEY` | `ZAI_BASE_URL` |
 
-Any other OpenAI-compatible service is reachable through the base `compat_oai.OpenAICompatible` plugin, which is what `gca.json` configures. See the [OpenAI-compatible plugin docs](https://genkit.dev/docs/go/integrations/openai-compatible/).
+Any other OpenAI-compatible service is reachable through the base `compat_oai.OpenAICompatible` plugin, selected with `"provider": "openai-compatible"`. See the [OpenAI-compatible plugin docs](https://genkit.dev/docs/go/integrations/openai-compatible/).

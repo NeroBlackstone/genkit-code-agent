@@ -12,7 +12,8 @@ const modelConfigOptionID acp.SessionConfigId = "model"
 
 // Model is a model the agent can run. Ref names it for genkit and is the value
 // the model config option carries, so a selection needs no mapping table. Group
-// names the provider and must be set: it is the selector's group header.
+// names the provider's entry and must be set: it is the selector's group
+// header.
 type Model struct {
 	Ref    string
 	Name   string

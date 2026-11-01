@@ -379,17 +379,17 @@ func TestLoadSessionReplaysToolCall(t *testing.T) {
 		t.Errorf("replayed rawOutput = %#v, want the live turn's %#v", outcome.RawOutput, liveOutcome.RawOutput)
 	}
 
-	// The text around the call replays with it: the prompt first, then the
-	// user message read_file injected the file's contents through, which
-	// is part of the stored conversation the model read and belongs to the
-	// replay like any other message.
+	// The text around the call replays with it: the prompt leads the
+	// user channel, and the injected file contents stay out of it —
+	// the live turn filtered them from the stream, so the replay
+	// drops them too; only the model still sees them in history.
 	rc2.testClient.mu.Lock()
 	events := append([]streamEvent(nil), rc2.events...)
 	rc2.testClient.mu.Unlock()
 	if got := joined(events, "user"); !strings.HasPrefix(got, "show me main.go") {
 		t.Errorf("replayed prompt = %q, want it leading the user channel", got)
-	} else if !strings.Contains(got, "<read_file path=") {
-		t.Errorf("replayed user channel = %q, want the injected file contents with the prompt", got)
+	} else if strings.Contains(got, "<read_file path=") {
+		t.Errorf("replayed user channel = %q, want the injected file contents skipped like they were live", got)
 	}
 	if want, got := "the file is read", joined(events, "message"); want != got {
 		t.Errorf("replayed answer = %q, want %q", got, want)

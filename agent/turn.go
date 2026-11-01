@@ -115,13 +115,10 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 		// Only the model's own output goes to the client: tool results
 		// arrive as tool-role chunks and the file contents read_file
 		// injects as user-role chunks, and neither is the agent's reply
-		// to stream under this turn's messageId.
-		// TODO: this filter is live-only: the dropped user-role chunks are
-		// still in resp.History(), so they persist with the transcript and
-		// session/load replays them as user messages — the UI shows the
-		// injected file contents after a reload it never streamed live.
-		// Mark injected messages on the way out (or strip them on save)
-		// so both paths agree, and give them a messageId while at it.
+		// to stream under this turn's messageId. The dropped user-role
+		// chunks stay in resp.History() for the model, so runTurn tags
+		// them on the way out and updatesForReplay skips tagged messages
+		// — a reload shows what the live turn showed, no more.
 		if chunk.Role != "" && chunk.Role != ai.RoleModel {
 			return nil
 		}
@@ -210,6 +207,28 @@ func (a *Agent) runTurn(ctx context.Context, params acp.PromptRequest, s *Sessio
 	if len(stored) > len(history) {
 		stored[len(history)].Metadata = map[string]any{"messageId": userMsgID}
 	}
+	// The prompt sits at len(history); every user message past it was
+	// injected by a tool — read_file's file contents — not typed by the
+	// user. The live stream filters those chunks out (see stream above),
+	// so tag them here, on the way out to the store, for the replay to
+	// skip the same way; the model keeps them either way. Each gets an
+	// id while the turn owns the transcript, so anything that does
+	// surface them can group them. genkit already tags its own
+	// injections (filesystemMiddlewareTool); this covers any other
+	// source and adds the id.
+	for i := len(history) + 1; i < len(stored); i++ {
+		m := stored[i]
+		if m.Role != ai.RoleUser {
+			continue
+		}
+		if m.Metadata == nil {
+			m.Metadata = map[string]any{}
+		}
+		m.Metadata["injected"] = true
+		if _, ok := m.Metadata["messageId"]; !ok {
+			m.Metadata["messageId"] = "msg_" + uuid.New().String()
+		}
+	}
 	if resp.Message.Metadata == nil {
 		resp.Message.Metadata = map[string]any{}
 	}
@@ -250,6 +269,15 @@ func updatesForReplay(m *ai.Message, cwd string) []acp.SessionUpdate {
 	savedID, _ := m.Metadata["messageId"].(string)
 	switch m.Role {
 	case ai.RoleUser:
+		// Tool-injected context (read_file's contents) never streamed
+		// live, so it does not replay either — the model keeps it in
+		// the transcript, the UI does not show what the live turn
+		// filtered out. genkit tags its injections with
+		// filesystemMiddlewareTool; runTurn tags anything else that
+		// rode in past the prompt with injected.
+		if injected, _ := m.Metadata["injected"].(bool); injected || m.Metadata["filesystemMiddlewareTool"] != nil {
+			return nil
+		}
 		var out []acp.SessionUpdate
 		for _, part := range m.Content {
 			if part == nil || part.Kind != ai.PartText || part.Text == "" {
